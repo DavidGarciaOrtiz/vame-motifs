@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vame-motifs"
+dynamic = ["version"]
+description = "Behavioural motifs over time from DeepLabCut pose CSV files, using VAME"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "GPL-3.0-or-later"
+authors = [{ name = "David García Ortiz", email = "davidgarciaortiz@ub.edu" }]
+dependencies = [
+    "vame-py==0.14.4",  # exact: the wrapper is written against this VAME API
+    "numpy",
+    "pandas",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+vame-motifs = "vame_motifs.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "vame_motifs.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120

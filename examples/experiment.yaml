@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------------------
+# One experiment = one YAML file. Copy it next to your data and edit it.
+# Relative paths are relative to THIS file, so the command works from any folder.
+# ---------------------------------------------------------------------------
+
+input:
+  pose_files: data/pose/          # a folder of DeepLabCut .csv files, or one .csv file
+  fps: 30                         # frame rate of the recordings
+
+keypoints:                        # names exactly as in the CSV header ('validate' lists them)
+  align_center: snout             # body part placed at (0, 0) by egocentric alignment
+  align_direction: tailbase       # body part that sets the orientation
+  exclude: []                     # body parts to leave out of the model, e.g. [tail_end]
+
+cleaning:
+  min_confidence: 0.9             # points with DLC likelihood below this are discarded and filled in
+
+motifs:
+  n_clusters: 15                  # number of motifs to look for
+  method: hmm                     # hmm | kmeans | both  (hmm is slower but smoother)
+
+output: outputs                   # VAME project, motif CSVs and run records go here
+
+# Optional. Defaults shown; most analyses never change them.
+# Changing time_window or zdims needs retraining: 'vame-motifs run --force'.
+advanced:
+  max_epochs: 100
+  time_window: 30                 # frames per window; also sets the label offset in the CSVs
+  zdims: 30                       # size of the latent space
+  seed: 42                        # same seed + same data = same motifs

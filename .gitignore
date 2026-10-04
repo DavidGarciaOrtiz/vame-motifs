@@ -1,0 +1,19 @@
+# Python build and cache files
+__pycache__/
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Data and results: they belong on the server, not in git
+*.csv
+*.h5
+*.npy
+*.nc
+*.mp4
+outputs/
+!tests/data/*.csv
+
+# OS / editor
+.DS_Store
+.vscode/
