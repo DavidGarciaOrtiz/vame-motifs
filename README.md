@@ -202,14 +202,18 @@ with SSH, while you keep working on your computer:
 Each command then runs in three steps, all shown in the output panel:
 
 - **upload**: the experiment file, and, with *Copy pose files and videos…* ticked, the pose
-  files and videos (only what changed, with `rsync`);
+  files and videos from your computer (only what changed, with `rsync`);
 - **run**: `vame-motifs <command> -c experiment.yaml` on the server, with its output streamed
   live; *Stop* ends it on the server too;
-- **download**: the output folder, back next to your experiment file, so *Open output folder*
-  shows the results (even after a failed command, for its run record).
+- **download**: the output folder, back to where your experiment file points, so *Open output
+  folder* shows the results (even after a failed command, for its run record).
 
-Paths that are absolute in the experiment file (e.g. `/pool01/...`) are taken to be paths on
-the server and are not copied: point them at data already on the server to skip uploading it.
+The pose files, videos and output folder can be anywhere on your computer. Those inside the
+experiment folder keep the same place in the server folder; those elsewhere are copied to
+`inputs/` in the server folder (and results come back from its `outputs/`), and the
+experiment file sent to the server points there. Your local experiment file is not changed.
+A path that does not exist on your computer (e.g. `/pool01/...`) is taken to be a path on the
+server and is not copied: point it at data already on the server to skip uploading it.
 The server settings are saved for your user in `~/.config/vame-motifs/gui.json`, not in the
 experiment file, and each experiment remembers its own folder on the server. This needs the
 `ssh` and `rsync` programs (included in macOS and Linux); *Connect* is not available on Windows,

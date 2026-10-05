@@ -3,13 +3,16 @@
 Training is the slow step and wants a GPU, which a laptop usually lacks. With a
 server set up, the window runs each command there instead of locally:
 
-    1. upload    the experiment YAML, and the pose files / videos when they are
-                 inside the experiment folder                (ssh + rsync)
+    1. upload    the experiment YAML, and the pose files / videos      (ssh + rsync)
     2. run       ssh server 'cd <folder> && python -m vame_motifs <command> -c <yaml>'
-    3. download  the output folder, back next to the local YAML  (rsync)
+    3. download  the output folder, back to where the local YAML points  (rsync)
 
-The same YAML works on both sides because its paths are relative to it.
-Absolute paths in it are taken to be paths on the server and are not copied.
+Paths inside the experiment folder keep the same place on the server, since the
+YAML's paths are relative to it. Pose files / videos found anywhere else on this
+computer are copied into the server's folder under inputs/, a local output
+folder elsewhere is filled from the server's outputs/, and the YAML sent to the
+server says so. A path that is not on this computer is taken to be a path on
+the server and is left as it is.
 
 "Connect" opens one SSH connection and keeps it open: an OpenSSH ControlMaster,
 a tunnel that every later ssh and rsync call goes through. A password or
@@ -34,11 +37,15 @@ import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import yaml
+
 SETTINGS_FILE = Path.home() / ".config" / "vame-motifs" / "gui.json"
 
 # One socket per user and server (%C: a hash of host, port and user). Unix
 # sockets have a ~100-character path limit, so not under the long macOS $TMPDIR.
 CONTROL_PATH = None if sys.platform == "win32" else f"/tmp/vame-motifs-{os.getuid()}-%C"
+
+SERVER_OUTPUT = "outputs"  # on the server, for a local output folder outside the experiment folder
 
 # Commands that write nothing to the output folder: nothing to download.
 NO_OUTPUT_COMMANDS = ("validate", "status")
@@ -81,7 +88,7 @@ class Step:
     title: str            # shown in the log before the step starts
     args: list[str]
     cwd: Path | None = None
-    stdin: Path | None = None  # file fed to the process
+    stdin: str | None = None  # text fed to the process
     tty: bool = False     # keep stdin open (ssh -tt): stopping the job ends the remote command
     makedir: Path | None = None  # local folder created before the step
 
@@ -186,6 +193,24 @@ def _inside(text: str) -> str | None:
     return None if rel == ".." or rel.startswith(".." + os.sep) else rel
 
 
+def _server_yaml(yaml_path: Path, server_paths: dict[str, str]) -> str:
+    """The experiment YAML as the server should read it: ``server_paths`` replace
+    the input/output paths that point to local copies."""
+    text = yaml_path.read_text()
+    if not server_paths:
+        return text
+    try:
+        raw = yaml.safe_load(text) or {}
+    except yaml.YAMLError as e:
+        raise RemoteError(f"{yaml_path.name} is not valid YAML: {e}") from e
+    for key, path in server_paths.items():
+        if key == "output":
+            raw["output"] = path
+        else:
+            raw.setdefault("input", {})[key] = path
+    return yaml.safe_dump(raw, sort_keys=False, default_flow_style=False)
+
+
 def remote_job(s: RemoteSettings, yaml_path: Path, command: str, flags: list[str], values: dict) -> tuple[list[Step], list[str]]:
     """The steps that run ``command`` on the server, and notes for the log.
 
@@ -196,36 +221,49 @@ def remote_job(s: RemoteSettings, yaml_path: Path, command: str, flags: list[str
     base, folder = yaml_path.parent, s.folder.strip().rstrip("/")
     notes: list[str] = []
 
-    uploads: list[str] = []  # relative to base
+    uploads: dict[Path, str] = {}  # local path -> path on the server, relative to folder
+    server_paths: dict[str, str] = {}  # YAML key -> its new value on the server
     for key in ("pose_files", "videos"):
         text = values.get(key, "").strip()
         if not text:
             continue
-        rel = _inside(text)
-        if rel is None:
-            notes.append(f"{key}: {text} is not inside the experiment folder: it must already exist on the server.")
-        elif not s.sync_data:
-            notes.append(f"{key}: not copied ('Copy data and results' is off): it must exist on the server as {folder}/{rel}.")
-        elif (base / rel).exists():
-            uploads.append(rel)
+        rel, local = _inside(text), base / Path(text).expanduser()
+        if not s.sync_data:
+            where = text if rel is None else f"{folder}/{rel}"
+            notes.append(f"{key}: not copied ('Copy data and results' is off): it must exist on the server as {where}.")
+        elif rel is not None:
+            if local.exists():
+                uploads[local] = rel
+            else:
+                notes.append(f"{key}: {local} does not exist here, so it is not copied.")
+        elif local.exists():  # elsewhere on this computer: copied into the server's folder
+            local = local.resolve()
+            if local not in uploads:  # pose files and videos may share a folder
+                uploads[local] = f"inputs/{key}" if local.is_dir() else f"inputs/{key}/{local.name}"
+            server_paths[key] = uploads[local]
+            notes.append(f"{key}: {local} is copied to the server as {folder}/{uploads[local]}.")
         else:
-            notes.append(f"{key}: {base / rel} does not exist here, so it is not copied.")
+            notes.append(f"{key}: {text} is not on this computer: it must already exist on the server.")
+
+    output = values.get("output", "").strip() or "outputs"
+    out_rel, local_out = _inside(output), base / Path(output).expanduser()
+    if out_rel is None and s.sync_data and (local_out.exists() or local_out.parent.exists()):
+        out_rel = server_paths["output"] = SERVER_OUTPUT  # a local folder elsewhere: filled from the server
 
     # Create the folders (the experiment folder and each upload's parent), then
     # write the YAML through the same ssh call: no rsync needed for it.
-    dirs = dict.fromkeys([folder] + [posixpath.normpath(f"{folder}/{Path(rel).parent.as_posix()}") for rel in uploads])
+    dirs = dict.fromkeys([folder] + [posixpath.normpath(f"{folder}/{Path(rel).parent.as_posix()}") for rel in uploads.values()])
     mkdir = "mkdir -p " + " ".join(shell_path(d) for d in dirs)
     write_yaml = f"cat > {shell_path(f'{folder}/{yaml_path.name}')}"
     steps = [Step("upload", f"Copying {yaml_path.name} to {s.host}:{folder}",
-                  ssh_command(s, f"{mkdir} && {write_yaml}"), stdin=yaml_path)]
+                  ssh_command(s, f"{mkdir} && {write_yaml}"), stdin=_server_yaml(yaml_path, server_paths))]
 
-    for rel in uploads:
-        local = base / rel
+    for local, rel in uploads.items():
         if local.is_dir():
             source, dest = f"{local}/", rsync_target(s, f"{folder}/{Path(rel).as_posix()}/")
         else:
             source, dest = str(local), rsync_target(s, f"{folder}/{Path(rel).parent.as_posix()}/")
-        steps.append(Step("upload", f"Copying {rel} to the server (only what changed)", _rsync(s, source, dest)))
+        steps.append(Step("upload", f"Copying {local} to the server (only what changed)", _rsync(s, source, dest)))
 
     cli = shlex.join(["-m", "vame_motifs", command, "-c", yaml_path.name, *flags])
     run = f"{s.python.strip()} {cli}"
@@ -236,12 +274,10 @@ def remote_job(s: RemoteSettings, yaml_path: Path, command: str, flags: list[str
                       ssh_command(s, remote, tty=True), tty=True))
 
     if s.sync_data and command not in NO_OUTPUT_COMMANDS:
-        output = values.get("output", "").strip() or "outputs"
-        rel = _inside(output)
-        if rel is None:
-            notes.append(f"output: {output} is not inside the experiment folder: results stay on the server.")
+        if out_rel is None:
+            notes.append(f"output: {output} is not on this computer: results stay on the server.")
         else:
-            steps.append(Step("download", f"Copying {rel}/ back from the server",
-                              _rsync(s, rsync_target(s, f"{folder}/{Path(rel).as_posix()}/"), f"{base / rel}/"),
-                              makedir=base / rel))
+            steps.append(Step("download", f"Copying the results back to {local_out}",
+                              _rsync(s, rsync_target(s, f"{folder}/{Path(out_rel).as_posix()}/"), f"{local_out}/"),
+                              makedir=local_out))
     return steps, notes

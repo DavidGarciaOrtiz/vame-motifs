@@ -18,7 +18,6 @@ Tkinter ships with Python, so no extra package is needed.
 
 from __future__ import annotations
 
-import contextlib
 import os
 import queue
 import shlex
@@ -567,14 +566,19 @@ class App(ttk.Frame):
         if step.makedir:
             step.makedir.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ, PYTHONUNBUFFERED="1")  # stream output as it is printed
-        stdin = subprocess.PIPE if step.tty else subprocess.DEVNULL
-        with open(step.stdin, "rb") if step.stdin else contextlib.nullcontext(stdin) as stdin:
+        stdin = subprocess.PIPE if step.tty or step.stdin is not None else subprocess.DEVNULL
+        try:
+            process = subprocess.Popen(step.args, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       text=True, bufsize=1, cwd=step.cwd, env=env)
+        except OSError as e:
+            self.output_queue.put(("line", f"Error: cannot start {step.args[0]}: {e}\n"))
+            return 127
+        if step.stdin is not None:
             try:
-                process = subprocess.Popen(step.args, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                           text=True, bufsize=1, cwd=step.cwd, env=env)
-            except OSError as e:
-                self.output_queue.put(("line", f"Error: cannot start {step.args[0]}: {e}\n"))
-                return 127
+                process.stdin.write(step.stdin)
+                process.stdin.close()  # end of file: the remote 'cat' finishes
+            except BrokenPipeError:
+                pass  # ssh failed before reading it: its exit code says why
         self.process = process
         for line in process.stdout:
             self.output_queue.put(("line", line))

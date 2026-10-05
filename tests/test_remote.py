@@ -2,6 +2,7 @@
 import shlex
 
 import pytest
+import yaml
 
 from vame_motifs import remote
 from vame_motifs.remote import RemoteError, RemoteSettings, remote_job
@@ -20,7 +21,7 @@ def test_job_uploads_runs_and_downloads(experiment, server):
     assert notes == []
 
     yaml_step, pose_step, run, download = steps
-    assert yaml_step.stdin == experiment
+    assert yaml_step.stdin == experiment.read_text()  # paths inside the folder: sent unchanged
     assert yaml_step.args[-1] == 'mkdir -p "$HOME"/vame/exp1 && cat > "$HOME"/vame/exp1/experiment.yaml'
     assert pose_step.args[-2:] == [f"{experiment.parent / 'pose'}/", "me@gpu.example.org:vame/exp1/pose/"]
 
@@ -44,7 +45,7 @@ def test_connection_options_go_through_the_tunnel(experiment, server):
 
 
 def test_server_paths_and_no_sync(experiment, server):
-    values = dict(VALUES, pose_files="/pool01/data/pose", output="../elsewhere")
+    values = dict(VALUES, pose_files="/pool01/data/pose", output="/pool01/results")
     steps, notes = remote_job(server, experiment, "segment", [], values)
     assert [s.kind for s in steps] == ["upload", "run"]  # nothing copied either way
     assert any("/pool01/data/pose" in n and "already exist on the server" in n for n in notes)
@@ -54,6 +55,39 @@ def test_server_paths_and_no_sync(experiment, server):
     steps, notes = remote_job(server, experiment, "train", [], VALUES)
     assert [s.kind for s in steps] == ["upload", "run"]
     assert "must exist on the server as ~/vame/exp1/pose" in notes[0]
+
+
+def test_local_files_outside_the_folder_are_copied(experiment, server, tmp_path_factory):
+    data = tmp_path_factory.mktemp("data")
+    (data / "pose").mkdir()
+    (data / "pose" / "rat01DLC.csv").write_text("x")
+    (data / "rat01.mp4").write_bytes(b"")
+    results = tmp_path_factory.mktemp("results")
+    values = dict(VALUES, pose_files=str(data / "pose"), videos=str(data / "rat01.mp4"), output=str(results))
+
+    steps, notes = remote_job(server, experiment, "train", [], values)
+    assert [s.kind for s in steps] == ["upload", "upload", "upload", "run", "download"]
+    yaml_step, pose_step, video_step, _, download = steps
+
+    sent = yaml.safe_load(yaml_step.stdin)
+    assert sent["input"]["pose_files"] == "inputs/pose_files"
+    assert sent["input"]["videos"] == "inputs/videos/rat01.mp4"
+    assert sent["output"] == "outputs" and sent["input"]["fps"] == 30  # the rest is kept
+    assert yaml_step.args[-1].startswith('mkdir -p "$HOME"/vame/exp1 "$HOME"/vame/exp1/inputs "$HOME"/vame/exp1/inputs/videos ')
+
+    assert pose_step.args[-2:] == [f"{(data / 'pose').resolve()}/", "me@gpu.example.org:vame/exp1/inputs/pose_files/"]
+    assert video_step.args[-2:] == [str((data / "rat01.mp4").resolve()), "me@gpu.example.org:vame/exp1/inputs/videos/"]
+    assert download.args[-2:] == ["me@gpu.example.org:vame/exp1/outputs/", f"{results}/"]
+    assert sum("is copied to the server" in n for n in notes) == 2
+
+
+def test_shared_local_folder_is_copied_once(experiment, server, tmp_path_factory):
+    data = tmp_path_factory.mktemp("data")
+    (data / "rat01DLC.csv").write_text("x")
+    steps, _ = remote_job(server, experiment, "train", [], dict(VALUES, pose_files=str(data), videos=str(data)))
+    assert [s.kind for s in steps] == ["upload", "upload", "run", "download"]
+    sent = yaml.safe_load(steps[0].stdin)["input"]
+    assert sent["pose_files"] == sent["videos"] == "inputs/pose_files"
 
 
 def test_nothing_to_download_after_validate(experiment, server):
