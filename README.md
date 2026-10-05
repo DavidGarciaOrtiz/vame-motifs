@@ -5,15 +5,18 @@ Behavioural motifs over time from DeepLabCut pose estimations, using [VAME](http
 **Input:** a folder of DeepLabCut `.csv` files (one per recording) and a short YAML file.
 **Output:** one `.csv` per recording with the motif of every frame, plus a motif-usage summary.
 
-No videos, no DeepLabCut installation and no DeepLabCut project are needed: body part
-names are read from the CSV header.
+No DeepLabCut installation or DeepLabCut project is needed: body part names are read
+from the CSV header. Raw videos are optional, and only needed for `videos`, the step
+that cuts short example clips of each motif.
 
-Future steps: motif identification video analysis, multi-animal analysis
+Future steps: multi-animal analysis
 
 ```
 pose .csv files ──▶ validate ──▶ prepare ──▶ train ──▶ segment ──▶ export ──▶ motif .csv per recording
-+ experiment.yaml   (seconds)    (align,     (slow,    (hmm and/   (frame,
-                                  clean)      GPU)      or kmeans)  time_s, motif)
++ experiment.yaml   (seconds)    (align,     (slow,    (hmm and/   (frame,                  │
+                                  clean)      GPU)      or kmeans)  time_s, motif)           ▼
+                                                                                      videos (optional)
+                                                                            short .mp4 clips, one per motif
 ```
 
 ## 1. Install
@@ -38,13 +41,19 @@ VAME picks the device by itself: CUDA GPU if present, then Apple MPS, then CPU.
   `scorer`, `bodyparts`, `coords`). Multi-animal files are not supported yet.
   All files must have the same body parts. The file name (without `.csv`) becomes
   the recording's name in every output.
-  
+
+- **Videos (optional):** the raw recordings DeepLabCut analysed, only needed for the
+  `videos` step. Each video is matched to its pose file the way DeepLabCut names them:
+  a video `rat01.mp4` is paired with the pose file `rat01DLC_resnet50_....csv` because
+  the video's name is a prefix of the pose file's. `.mp4` and `.avi` are supported.
+
 - **Experiment file:** copy [`examples/experiment.yaml`](examples/experiment.yaml)
   next to your data and edit it. Paths in it are relative to the YAML file.
 
 ```yaml
 input:
   pose_files: data/pose/          # folder of DLC .csv files, or one .csv file
+  videos: data/videos/            # optional: folder of raw videos, or one file; needed for 'videos'
   fps: 30
 keypoints:
   align_center: snout             # placed at (0, 0) by egocentric alignment
@@ -83,8 +92,9 @@ be run one by one:
 | `train`   | Trains and evaluates the VAME model | the slow part: use a GPU |
 | `segment` | Assigns a motif to every time window (`--force` recomputes) | minutes (kmeans is much faster than hmm) |
 | `export`  | Writes the motif CSVs and the usage summary | seconds |
+| `videos`  | Cuts a short `.mp4` per motif per recording, from `input.videos` (needs `input.videos`) | minutes |
 | `status`  | Shows which steps are done | instant |
-| `run`     | `validate` then all of the above (`--force` redoes every step) | |
+| `run`     | `validate` then all of the above (`--force` redoes every step); `videos` only runs if `input.videos` is set | |
 
 **Changing settings later**
 
@@ -117,6 +127,10 @@ outputs/
 │       └── motif_usage.csv          share of time in each motif, one row per recording
 ├── runs/<date>_<command>/           experiment.yaml copy, versions.txt, run.log
 └── vame_project/                    VAME's own project (model, logs, plots in model/evaluate/)
+    └── results/<recording>/VAME/hmm-<n_clusters>/cluster_videos/
+        ├── <recording>-motif_0.mp4  (only if input.videos was set, after 'videos')
+        ├── <recording>-motif_1.mp4
+        └── ...
 ```
 
 `<recording>_motifs.csv`:
@@ -152,6 +166,8 @@ that produced it.
 | `<part>: 60% of frames below likelihood 0.9` | A warning: that body part will be mostly filled in. Improve tracking in DLC or add it to `keypoints.exclude`. |
 | `Training finished without saving a model` | VAME only saves a model after its warm-up epochs; raise `advanced.max_epochs`. |
 | `No hmm labels for '...'. Run 'segment' first.` | `export` was run before `segment`, or with a different `n_clusters`. |
+| `No raw videos configured (input.videos). ...` | `videos` was run without setting `input.videos` in the YAML. |
+| `input.videos: no video matches pose file '...'` | No video in `input.videos` has a name that is a prefix of that pose file's name (the DeepLabCut naming convention). |
 | `VAME is not installed in this environment` | Activate the right environment (`conda activate vame`). |
 
 ## 6. Code layout

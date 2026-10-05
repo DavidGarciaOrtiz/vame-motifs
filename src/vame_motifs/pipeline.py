@@ -8,6 +8,7 @@ VAME's config and calls VAME's functions in order:
              + training set
     train    train + evaluate the model (the only slow, GPU-worthy step)
     segment  motif segmentation (hmm and/or kmeans)
+    videos   cut a short .mp4 per motif per session from input.videos (optional)
 
 Whether a step is done is decided by the files it must produce, not by VAME's
 states/states.json: VAME logs some failures and still records "success".
@@ -108,6 +109,7 @@ class VamePipeline:
             poses_estimations=[str(p) for p in self.cfg.pose_files],
             source_software=SOURCE_SOFTWARE,
             working_directory=str(self.cfg.output),
+            videos=[str(v) for v in self.cfg.videos] or None,  # paired positionally with pose_files
             fps=self.cfg.fps,
             config_kwargs=dict(settings),  # a copy: VAME adds its own keys to this dict
         )
@@ -159,13 +161,37 @@ class VamePipeline:
         if missing:
             raise PipelineError(f"VAME segmentation did not produce {missing[0]}. See {self._log('pose_segmentation')}")
 
+    # --- step 7: motif videos (optional; needs input.videos) ------------
+    def motif_videos_dir(self, session: str, algorithm: str) -> Path:
+        """Where VAME saves a session's motif clips."""
+        n = self.cfg.n_clusters
+        return self.project_path / "results" / session / MODEL_NAME / f"{algorithm}-{n}" / "cluster_videos"
+
+    def has_motif_videos(self) -> bool:
+        return all(
+            any(self.motif_videos_dir(p.stem, algorithm).glob("*.mp4"))
+            for algorithm in self.cfg.algorithms
+            for p in self.cfg.pose_files
+        )
+
+    def motif_videos(self) -> None:
+        """One short .mp4 per motif, per session, cut from input.videos."""
+        if not self.cfg.videos:
+            raise PipelineError("No raw videos configured (input.videos). Motif videos need the original recordings.")
+        if self.missing_labels():
+            raise PipelineError("No motif labels yet. Run 'segment' first.")
+        vame = _import_vame()
+        vame.motif_videos(config=self.config)
+        if not self.has_motif_videos():
+            raise PipelineError(f"VAME did not create any motif videos. See {self._log('motif_videos')}")
+
     # --- all steps ------------------------------------------------------
     def run(self, force: bool = False) -> None:
-        """init -> prepare -> train -> segment, skipping finished steps unless force=True.
+        """init -> prepare -> train -> segment -> videos, skipping finished steps unless force=True.
 
         Segmentation always runs: VAME itself skips results that already exist
         for the current n_clusters, so a new n_clusters is segmented without
-        retraining.
+        retraining. Motif videos only run when input.videos was set.
         """
         self.init()
         if force or not self.trainset_path.exists():
@@ -177,3 +203,8 @@ class VamePipeline:
         else:
             logger.info("train: already done, skipping (use --force to retrain)")
         self.segment(overwrite=force)
+        if self.cfg.videos:
+            if force or not self.has_motif_videos():
+                self.motif_videos()
+            else:
+                logger.info("motif videos: already done, skipping (use --force to redo)")

@@ -18,6 +18,7 @@ import yaml
 
 MIN_EPOCHS = 10
 METHODS = {"hmm": ["hmm"], "kmeans": ["kmeans"], "both": ["hmm", "kmeans"]}
+VIDEO_SUFFIXES = (".mp4", ".avi")  # the formats VAME's own video step accepts
 
 
 class ConfigError(ValueError):
@@ -35,6 +36,7 @@ class ExperimentConfig:
     method: str = "hmm"
     min_confidence: float = 0.9
     exclude: list[str] = field(default_factory=list)
+    videos: list[Path] = field(default_factory=list)
     output: Path = Path("outputs")
     project_name: str = "vame_project"
     # advanced: sensible defaults, most researchers never change them
@@ -77,6 +79,41 @@ def _find_pose_files(pose_path: Path) -> list[Path]:
     return files
 
 
+def _find_videos(video_path: Path, pose_files: list[Path]) -> list[Path]:
+    """Raw videos paired to ``pose_files``, one per file, in the same order.
+
+    DeepLabCut names a pose CSV after the video it analysed plus its own
+    suffix (``session1.mp4`` -> ``session1DLC_resnet50_....csv``), so each
+    video is matched to the pose file whose name it is the longest prefix of.
+    """
+    if not video_path.exists():
+        raise ConfigError(f"input.videos: {video_path} does not exist")
+    if video_path.is_file():
+        if video_path.suffix.lower() not in VIDEO_SUFFIXES:
+            raise ConfigError(f"input.videos: {video_path.name} is not a supported video format ({', '.join(VIDEO_SUFFIXES)})")
+        candidates = [video_path]
+    else:
+        candidates = sorted(p for p in video_path.iterdir() if p.suffix.lower() in VIDEO_SUFFIXES)
+        if not candidates:
+            raise ConfigError(f"input.videos: no video files ({', '.join(VIDEO_SUFFIXES)}) found in {video_path}")
+
+    videos = []
+    for pose_path in pose_files:
+        matches = [v for v in candidates if pose_path.stem.startswith(v.stem)]
+        if not matches:
+            raise ConfigError(
+                f"input.videos: no video matches pose file '{pose_path.name}' "
+                f"(expected a video whose file name is a prefix of '{pose_path.stem}', "
+                "i.e. the one DeepLabCut analysed)"
+            )
+        videos.append(max(matches, key=lambda v: len(v.stem)))  # most specific prefix wins
+
+    reused = {v for v in videos if videos.count(v) > 1}
+    if reused:
+        raise ConfigError(f"input.videos: {', '.join(sorted(v.name for v in reused))} each match more than one pose file")
+    return videos
+
+
 def load_config(path: str | Path) -> ExperimentConfig:
     """Read the experiment YAML into a checked ExperimentConfig."""
     path = Path(path).expanduser().resolve()
@@ -93,9 +130,10 @@ def load_config(path: str | Path) -> ExperimentConfig:
     motifs, adv = _section(raw, "motifs"), _section(raw, "advanced")
 
     try:
+        pose_files = _find_pose_files(base / _require(inp, "pose_files", "input"))
         cfg = ExperimentConfig(
             yaml_path=path,
-            pose_files=_find_pose_files(base / _require(inp, "pose_files", "input")),
+            pose_files=pose_files,
             fps=float(_require(inp, "fps", "input")),
             align_center=str(_require(kp, "align_center", "keypoints")),
             align_direction=str(_require(kp, "align_direction", "keypoints")),
@@ -103,6 +141,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             method=str(motifs.get("method", "hmm")),
             min_confidence=float(_section(raw, "cleaning").get("min_confidence", 0.9)),
             exclude=list(kp.get("exclude") or []),
+            videos=_find_videos(base / inp["videos"], pose_files) if inp.get("videos") else [],
             output=base / raw.get("output", "outputs"),
             project_name=str(raw.get("project_name", "vame_project")),
             max_epochs=int(adv.get("max_epochs", 100)),

@@ -29,13 +29,20 @@ def write_dlc_csv(path: Path, n_frames: int = 200, bodyparts=BODYPARTS, bad: str
     return path
 
 
+def write_video(path: Path) -> Path:
+    """An empty stand-in for a raw video file; config-level tests only check names/extensions."""
+    path.write_bytes(b"")
+    return path
+
+
 def write_yaml(folder: Path, **overrides) -> Path:
-    settings = {"n_clusters": 5, "method": "hmm", "align_center": "snout", "exclude": "[]"} | overrides
+    settings = {"n_clusters": 5, "method": "hmm", "align_center": "snout", "exclude": "[]", "videos": ""} | overrides
     path = folder / "experiment.yaml"
+    videos_line = f"  videos: {settings['videos']}\n" if settings["videos"] else ""
     path.write_text(
         f"""input:
   pose_files: pose/
-  fps: 30
+{videos_line}  fps: 30
 keypoints:
   align_center: {settings['align_center']}
   align_direction: tailbase

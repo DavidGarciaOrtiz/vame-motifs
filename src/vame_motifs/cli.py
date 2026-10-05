@@ -7,7 +7,7 @@ notebooks can call it directly.
 Typical use::
 
     vame-motifs validate -c experiment.yaml     # seconds: check the CSVs and the YAML
-    vame-motifs run      -c experiment.yaml     # everything: prepare, train, segment, export
+    vame-motifs run      -c experiment.yaml     # everything: prepare, train, segment, export, videos
 
 Exit codes: 0 success, 1 a problem with the input or a missing step
 (short message, no traceback), 2 wrong command-line arguments.
@@ -42,6 +42,8 @@ def cmd_validate(cfg: ExperimentConfig, args) -> None:
     print(f"Alignment : center={cfg.align_center}, direction={cfg.align_direction}")
     if cfg.exclude:
         print(f"Excluded  : {', '.join(cfg.exclude)}")
+    if cfg.videos:
+        print(f"Videos    : {len(cfg.videos)} file(s) for motif videos")
     print()
     for r in reports:
         status = "OK" if not r.warnings else "WARNING"
@@ -73,6 +75,11 @@ def cmd_export(cfg: ExperimentConfig, args) -> None:
     print(f"Wrote {len(written)} file(s) to {cfg.motifs_dir}")
 
 
+def cmd_videos(cfg: ExperimentConfig, args) -> None:
+    VamePipeline(cfg).motif_videos()
+    print(f"Wrote motif videos under {cfg.output / cfg.project_name / 'results'}")
+
+
 def cmd_run(cfg: ExperimentConfig, args) -> None:
     cmd_validate(cfg, args)  # fail in seconds, not after preprocessing
     VamePipeline(cfg).run(force=args.force)
@@ -95,6 +102,8 @@ def cmd_status(cfg: ExperimentConfig, args) -> None:
     for algorithm in cfg.algorithms:
         n_csv = len(list((cfg.motifs_dir / algorithm).glob("*_motifs.csv")))
         print(f"  export   : {algorithm}: {n_csv}/{len(cfg.pose_files)} motif CSVs")
+    if cfg.videos:
+        print(f"  videos   : {mark(pipeline.has_motif_videos())}")
 
 
 # name -> (function, help text, keeps a run record?)
@@ -105,7 +114,8 @@ COMMANDS: dict[str, tuple[Callable, str, bool]] = {
     "train":    (cmd_train,    "Train and evaluate the VAME model (slow; GPU)", True),
     "segment":  (cmd_segment,  "Assign a motif to every time window", True),
     "export":   (cmd_export,   "Write motif CSVs + motif usage summary", False),
-    "run":      (cmd_run,      "validate -> prepare -> train -> segment -> export", True),
+    "videos":   (cmd_videos,   "Cut a short .mp4 per motif, per session, from input.videos", True),
+    "run":      (cmd_run,      "validate -> prepare -> train -> segment -> export -> videos", True),
     "status":   (cmd_status,   "Show which steps are done", False),
 }
 

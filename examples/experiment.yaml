@@ -4,12 +4,13 @@
 # ---------------------------------------------------------------------------
 
 input:
-  pose_files: data/pose/          # a folder of DeepLabCut .csv files, or one .csv file
+  pose_files: /pool01/projects/abante_lab/dopamap_beh/results_analysis/01022023_001_16236-62755DLC_Resnet50_Test-ExampleSep16shuffle1_snapshot_best-84_filtered.csv        # a folder of DeepLabCut .csv files, or one .csv file
+  # videos: data/videos/          # optional: folder of raw .mp4/.avi videos, or one file; needed for 'vame-motifs videos'
   fps: 30                         # frame rate of the recordings
 
 keypoints:                        # names exactly as in the CSV header ('validate' lists them)
-  align_center: snout             # body part placed at (0, 0) by egocentric alignment
-  align_direction: tailbase       # body part that sets the orientation
+  align_center: snout            # body part placed at (0, 0) by egocentric alignment
+  align_direction: tail       # body part that sets the orientation
   exclude: []                     # body parts to leave out of the model, e.g. [tail_end]
 
 cleaning:
