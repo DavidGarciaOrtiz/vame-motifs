@@ -10,15 +10,22 @@ Each command runs as its own process (``python -m vame_motifs <command> -c
 same exit codes. That keeps the window responsive during training and lets a
 run be stopped.
 
+With 'On GPU server' ticked, the same command runs on a server over SSH
+instead, with the files copied there and the results copied back (remote.py).
+
 Tkinter ships with Python, so no extra package is needed.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import queue
+import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -26,7 +33,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import yaml
 
-from vame_motifs import __version__
+from vame_motifs import __version__, remote
 from vame_motifs.cli import COMMANDS
 from vame_motifs.config import METHODS, VIDEO_SUFFIXES
 
@@ -120,10 +127,19 @@ class App(ttk.Frame):
         super().__init__(root, padding=8)
         self.root = root
         self.yaml_path: Path | None = None
-        self.process: subprocess.Popen | None = None
-        self.output_queue: queue.Queue[str | None] = queue.Queue()
+        self.process: subprocess.Popen | None = None  # the running step of a job
+        self.running = False                           # a job (one or more steps) is running
+        self.stopping = False
+        self.job_remote = False
+        # ('line', text) | ('info', text) | ('done', exit code, failed step kind) | ('tunnel_closed',)
+        self.output_queue: queue.Queue[tuple] = queue.Queue()
         self.vars: dict[str, tk.StringVar] = {}
         self.dirty = False
+        self.settings = remote.load_settings()
+        self.tunnel: subprocess.Popen | None = None    # the open SSH connection ('Connect')
+        self.tunnel_settings: remote.RemoteSettings | None = None
+        self.tunnel_ready = False
+        self.askpass_dir: str | None = None
 
         root.title("vame-motifs")
         root.minsize(980, 680)
@@ -141,6 +157,7 @@ class App(ttk.Frame):
         self.rowconfigure(2, weight=1)
 
         self.set_values(DEFAULTS)
+        self._load_server_settings()
         if yaml_path:
             self.load(Path(yaml_path))
         self._update_title()
@@ -251,6 +268,48 @@ class App(ttk.Frame):
                             "tick 'Force' and use 'Run all'.", foreground="gray").grid(
             row=6, column=0, columnspan=5, sticky="w", pady=(10, 0))
 
+        self._build_server_tab(notebook)
+
+    def _build_server_tab(self, notebook: ttk.Notebook) -> None:
+        """Where to run on a GPU server. Saved per user (remote.SETTINGS_FILE), not in the experiment YAML."""
+        srv = ttk.Frame(notebook, padding=10)
+        srv.columnconfigure(1, weight=1)
+        notebook.add(srv, text="GPU server")
+        self.server_vars: dict[str, tk.StringVar] = {}
+        for row, (label, key, hint) in enumerate([
+            ("Server", "host", "user@host, or a name from ~/.ssh/config"),
+            ("Port", "port", "empty = 22"),
+            ("Key file", "key_file", "empty = your default SSH key"),
+            ("Jump host", "jump_host", "optional: login node to go through"),
+            ("Folder on server", "folder", "relative = in your home folder"),
+            ("Python on server", "python", "with vame-motifs installed"),
+            ("Run prefix", "prefix", "optional, e.g. srun --gres=gpu:1"),
+        ]):
+            ttk.Label(srv, text=label).grid(row=row, column=0, sticky="w", padx=(0, 6), pady=2)
+            var = self.server_vars[key] = tk.StringVar()
+            ttk.Entry(srv, textvariable=var, width=22).grid(row=row, column=1, sticky="ew", pady=2)
+            ttk.Label(srv, text=hint, foreground="gray").grid(row=row, column=3, sticky="w", padx=4)
+        ttk.Button(srv, text="File…", width=6, command=self._browse_key).grid(row=2, column=2, padx=2)
+
+        self.sync_data = tk.BooleanVar(value=True)
+        ttk.Checkbutton(srv, text="Copy pose files and videos to the server, and results back",
+                        variable=self.sync_data).grid(row=7, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
+        bar = ttk.Frame(srv)
+        bar.grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        self.connect_button = ttk.Button(bar, text="Connect", command=self.connect)
+        self.connect_button.pack(side="left")
+        self.disconnect_button = ttk.Button(bar, text="Disconnect", command=self.disconnect, state="disabled")
+        self.disconnect_button.pack(side="left", padx=4)
+        self.tunnel_label = ttk.Label(bar, text="Not connected", foreground="gray")
+        self.tunnel_label.pack(side="left", padx=6)
+
+        ttk.Label(srv, foreground="gray", wraplength=560, justify="left", text=(
+            "Tick 'On GPU server' (Run box) to run the commands there. 'Connect' opens one SSH connection and "
+            "keeps it open, so a password or code is asked only once; with an SSH key it is optional. "
+            "Python example: ~/miniconda3/envs/vame/bin/python. Absolute paths in the experiment are "
+            "taken as paths on the server.")).grid(row=9, column=0, columnspan=4, sticky="w", pady=(10, 0))
+
     def _build_steps(self) -> None:
         box = ttk.LabelFrame(self, text="Run", padding=10)
         box.grid(row=1, column=1, sticky="nsew")
@@ -274,8 +333,10 @@ class App(ttk.Frame):
         options.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.force = tk.BooleanVar()
         self.verbose = tk.BooleanVar()
+        self.run_remote = tk.BooleanVar()
         ttk.Checkbutton(options, text="Force (redo steps)", variable=self.force).pack(side="left")
         ttk.Checkbutton(options, text="Verbose", variable=self.verbose).pack(side="left", padx=10)
+        ttk.Checkbutton(options, text="On GPU server", variable=self.run_remote).pack(side="left")
 
         actions = ttk.Frame(box)
         actions.grid(row=row + 1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
@@ -405,6 +466,7 @@ class App(ttk.Frame):
         if self._confirm_discard():
             self.yaml_path = None
             self.set_values(DEFAULTS)
+            self._set_server_folder()
 
     def open(self) -> None:
         if not self._confirm_discard():
@@ -424,6 +486,7 @@ class App(ttk.Frame):
             return
         self.yaml_path = path.resolve()
         self.set_values(yaml_to_form(raw))
+        self._set_server_folder()
         self._write_log(f"Opened {self.yaml_path}\n", "info")
 
     def save(self) -> bool:
@@ -447,60 +510,111 @@ class App(ttk.Frame):
             text = self.vars[key].get().strip()
             if text and not Path(text).expanduser().is_absolute():
                 self.vars[key].set(os.path.relpath(old_base / text, self.yaml_path.parent))
+        self._set_server_folder(keep_typed=True)
         return self.save()
 
     # ==================================================================
     # Running commands
     # ==================================================================
     def run_command(self, command: str) -> None:
-        if self.process is not None:
+        if self.running:
             return
         if self.dirty or self.yaml_path is None:
             if not self.save():
                 return
-        args = [sys.executable, "-m", "vame_motifs", command, "-c", str(self.yaml_path)]
+        flags = []
         if self.force.get() and command in ("run", "segment"):
-            args.append("--force")
+            flags.append("--force")
         if self.verbose.get():
-            args.append("-v")
+            flags.append("-v")
 
-        self._write_log(f"\n$ vame-motifs {' '.join(args[3:])}\n", "info")
-        env = dict(os.environ, PYTHONUNBUFFERED="1")  # stream output as it is printed
-        try:
-            self.process = subprocess.Popen(
-                args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-                cwd=self.yaml_path.parent, env=env,
-            )
-        except OSError as e:
-            self._write_log(f"Cannot start: {e}\n", "error")
-            return
+        if self.run_remote.get():
+            try:
+                steps, notes = remote.remote_job(self._server_settings(), self.yaml_path, command, flags,
+                                                 self.get_values())
+            except remote.RemoteError as e:
+                messagebox.showerror("GPU server", str(e))
+                return
+            self._save_server_settings()
+            for note in notes:
+                self._write_log(f"Note: {note}\n", "info")
+        else:
+            args = [sys.executable, "-m", "vame_motifs", command, "-c", str(self.yaml_path), *flags]
+            steps = [remote.Step("run", f"vame-motifs {' '.join(args[3:])}", args, cwd=self.yaml_path.parent)]
+
+        self.job_remote = self.run_remote.get()
+        self.stopping = False
         self._set_running(command)
-        threading.Thread(target=self._read_output, args=(self.process,), daemon=True).start()
+        threading.Thread(target=self._run_job, args=(steps,), daemon=True).start()
 
-    def _read_output(self, process: subprocess.Popen) -> None:
-        """Background thread: forward the command's output to the window (Tk is not thread-safe)."""
+    def _run_job(self, steps: list[remote.Step]) -> None:
+        """Background thread: run the steps in order, forwarding their output to the window
+        (Tk is not thread-safe). A failed upload ends the job; results are still copied
+        back after a failed command, for its run record and log."""
+        code, failed = 0, None
+        for step in steps:
+            if self.stopping or (step.kind == "download" and code == remote.SSH_FAILED):
+                break
+            self.output_queue.put(("info", f"\n$ {step.title}\n"))
+            step_code = self._run_step(step)
+            if step_code != 0 and failed is None:
+                code, failed = step_code, step.kind
+            if step_code != 0 and (step.kind == "upload" or step_code == remote.SSH_FAILED):
+                break
+        self.output_queue.put(("done", code, failed))
+
+    def _run_step(self, step: remote.Step) -> int:
+        if step.makedir:
+            step.makedir.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ, PYTHONUNBUFFERED="1")  # stream output as it is printed
+        stdin = subprocess.PIPE if step.tty else subprocess.DEVNULL
+        with open(step.stdin, "rb") if step.stdin else contextlib.nullcontext(stdin) as stdin:
+            try:
+                process = subprocess.Popen(step.args, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                           text=True, bufsize=1, cwd=step.cwd, env=env)
+            except OSError as e:
+                self.output_queue.put(("line", f"Error: cannot start {step.args[0]}: {e}\n"))
+                return 127
+        self.process = process
         for line in process.stdout:
-            self.output_queue.put(line)
+            self.output_queue.put(("line", line))
         process.wait()
-        self.output_queue.put(None)  # finished
+        if process.stdin:
+            process.stdin.close()
+        self.process = None
+        return process.returncode
 
     def _drain_output(self) -> None:
         try:
             while True:
-                line = self.output_queue.get_nowait()
-                if line is None:
-                    self._finished()
+                item = self.output_queue.get_nowait()
+                if item[0] == "done":
+                    self._finished(*item[1:])
+                elif item[0] == "tunnel_closed":
+                    self._tunnel_closed()
+                elif item[0] == "info":
+                    self._write_log(item[1], "info")
                 else:
+                    line = item[1]
                     self._write_log(line, "error" if line.startswith(("Error:", "Traceback")) else None)
         except queue.Empty:
             pass
         self.after(100, self._drain_output)
 
-    def _finished(self) -> None:
-        code = self.process.returncode if self.process else None
-        self.process = None
-        messages = {0: "Finished", 1: "Failed: see the error above", 2: "Wrong command-line arguments"}
-        text = messages.get(code, f"Stopped (exit code {code})")
+    def _finished(self, code: int, failed: str | None) -> None:
+        self.running = False
+        messages = {0: "Finished", 1: "Failed: see the error above", 2: "Wrong command-line arguments",
+                    127: "Program not found: see the error above"}
+        if self.stopping:
+            text = "Stopped"
+        elif self.job_remote and code == remote.SSH_FAILED:
+            text = "Cannot connect to the server: 'Connect' in the GPU server tab, or check its settings"
+        elif failed == "upload":
+            text = f"Copying the files to the server failed (exit code {code})"
+        elif failed == "download":
+            text = f"Finished on the server, but copying the results back failed (exit code {code})"
+        else:
+            text = messages.get(code, f"Stopped (exit code {code})")
         self._write_log(f"[{text}]\n", "info" if code == 0 else "error")
         self.status_label.configure(text=text)
         for button in self.step_buttons:
@@ -508,14 +622,153 @@ class App(ttk.Frame):
         self.stop_button.configure(state="disabled")
 
     def _set_running(self, command: str) -> None:
+        self.running = True
         for button in self.step_buttons:
             button.configure(state="disabled")
         self.stop_button.configure(state="normal")
-        self.status_label.configure(text=f"Running '{command}'…")
+        where = f" on {self.server_vars['host'].get().strip()}" if self.job_remote else ""
+        self.status_label.configure(text=f"Running '{command}'{where}…")
 
     def stop(self) -> None:
-        if self.process is not None and messagebox.askyesno("Stop", "Stop the running command?"):
-            self.process.terminate()
+        if self.running and messagebox.askyesno("Stop", "Stop the running command?"):
+            self._stop_job()
+
+    def _stop_job(self) -> None:
+        self.stopping = True  # no further steps start
+        process = self.process
+        if process is not None:
+            process.terminate()  # remote: closing ssh hangs up the command on the server
+
+    # ==================================================================
+    # GPU server
+    # ==================================================================
+    def _load_server_settings(self) -> None:
+        saved = remote.settings_from_dict(self.settings["server"])
+        for key, var in self.server_vars.items():
+            var.set(getattr(saved, key))
+        self.sync_data.set(saved.sync_data)
+        self.run_remote.set(bool(self.settings["server"].get("run_on_server", False)))
+
+    def _server_settings(self) -> remote.RemoteSettings:
+        return remote.RemoteSettings(**{key: var.get() for key, var in self.server_vars.items()},
+                                     sync_data=self.sync_data.get())
+
+    def _set_server_folder(self, keep_typed: bool = False) -> None:
+        """The experiment's folder on the server: the one used before, or one named after the local folder."""
+        var = self.server_vars["folder"]
+        if self.yaml_path is None:
+            var.set("")
+        elif str(self.yaml_path) in self.settings["folders"]:
+            var.set(self.settings["folders"][str(self.yaml_path)])
+        elif not (keep_typed and var.get().strip()):
+            var.set(remote.default_folder(self.yaml_path))
+
+    def _save_server_settings(self) -> None:
+        server = {key: value for key, value in vars(self._server_settings()).items() if key != "folder"}
+        server["run_on_server"] = self.run_remote.get()
+        self.settings["server"] = server
+        if self.yaml_path is not None and self.server_vars["folder"].get().strip():
+            self.settings["folders"][str(self.yaml_path)] = self.server_vars["folder"].get().strip()
+        try:
+            remote.save_settings(self.settings)
+        except OSError as e:
+            self._write_log(f"Cannot save the server settings: {e}\n", "error")
+
+    def _browse_key(self) -> None:
+        path = filedialog.askopenfilename(initialdir=Path.home() / ".ssh")
+        if path:
+            self.server_vars["key_file"].set(path)
+
+    def _askpass(self) -> str:
+        """An executable that shows askpass.py's password window: SSH_ASKPASS takes a program, not a command."""
+        if self.askpass_dir is None:
+            self.askpass_dir = tempfile.mkdtemp(prefix="vame-motifs-")
+        script = Path(self.askpass_dir) / "askpass"
+        script.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -m vame_motifs.askpass "$@"\n')
+        script.chmod(0o700)
+        return str(script)
+
+    def connect(self) -> None:
+        """Open the SSH connection that later commands go through (see remote.py)."""
+        if self.tunnel is not None:
+            return
+        if remote.CONTROL_PATH is None:
+            messagebox.showinfo("GPU server", "Keeping a connection open is not available on Windows. "
+                                              "Use an SSH key: commands then connect by themselves.")
+            return
+        settings = self._server_settings()
+        if not settings.host.strip():
+            messagebox.showerror("GPU server", "Set the server (user@host) first.")
+            return
+        self._save_server_settings()
+        env = dict(os.environ, SSH_ASKPASS=self._askpass(), SSH_ASKPASS_REQUIRE="force")
+        env.setdefault("DISPLAY", ":0")  # older OpenSSH only uses SSH_ASKPASS when DISPLAY is set
+        args = remote.master_command(settings)
+        self._write_log(f"\n$ {shlex.join(args)}\n", "info")
+        try:
+            # A new session: no terminal, so ssh asks through the password window.
+            self.tunnel = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.PIPE, text=True, env=env, start_new_session=True)
+        except OSError as e:
+            self._write_log(f"Error: cannot start ssh: {e}\n", "error")
+            return
+        self.tunnel_settings, self.tunnel_ready = settings, False
+        threading.Thread(target=self._read_tunnel, args=(self.tunnel,), daemon=True).start()
+        self._set_tunnel_state(f"Connecting to {settings.host.strip()}…", connected=True)
+        self.after(500, self._check_tunnel)
+
+    def _read_tunnel(self, tunnel: subprocess.Popen) -> None:
+        for line in tunnel.stderr:
+            self.output_queue.put(("line", f"ssh: {line}"))
+        tunnel.wait()
+        self.output_queue.put(("tunnel_closed",))
+
+    def _check_tunnel(self) -> None:
+        """Poll until the connection is ready (after the password, if any)."""
+        if self.tunnel is None or self.tunnel_ready or self.tunnel.poll() is not None:
+            return
+        try:
+            ok = subprocess.run(remote.check_command(self.tunnel_settings), stdin=subprocess.DEVNULL,
+                                capture_output=True, timeout=5, check=False).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            ok = False
+        if ok:
+            self.tunnel_ready = True
+            self._set_tunnel_state(f"Connected to {self.tunnel_settings.host.strip()}", connected=True)
+            self._write_log(f"[Connected to {self.tunnel_settings.host.strip()}]\n", "info")
+        else:
+            self.after(500, self._check_tunnel)
+
+    def _tunnel_closed(self) -> None:
+        if self.tunnel is None:
+            return
+        code = self.tunnel.wait()
+        host = self.tunnel_settings.host.strip()
+        if self.tunnel_ready or code in (0, -15):
+            self._write_log(f"[Disconnected from {host}]\n", "info")
+        else:
+            self._write_log(f"[Cannot connect to {host} (exit code {code}): see the ssh lines above]\n", "error")
+        self.tunnel, self.tunnel_ready = None, False
+        self._set_tunnel_state("Not connected", connected=False)
+
+    def _set_tunnel_state(self, text: str, connected: bool) -> None:
+        self.tunnel_label.configure(text=text, foreground="" if connected else "gray")
+        self.connect_button.configure(state="disabled" if connected else "normal")
+        self.disconnect_button.configure(state="normal" if connected else "disabled")
+
+    def disconnect(self, ask: bool = True) -> None:
+        if self.tunnel is None:
+            return
+        if ask and self.running and self.job_remote and not messagebox.askyesno(
+                "Disconnect", "A command is running on the server through this connection. Stop it and disconnect?"):
+            return
+        try:
+            subprocess.run(remote.exit_command(self.tunnel_settings), stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=5, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if self.tunnel.poll() is None:
+            self.tunnel.terminate()
 
     def open_output(self) -> None:
         folder = self._resolve(self.vars["output"].get().strip() or "outputs")
@@ -544,11 +797,15 @@ class App(ttk.Frame):
         self.log.configure(state="disabled")
 
     def on_close(self) -> None:
-        if self.process is not None:
+        if self.running:
             if not messagebox.askyesno("Quit", "A command is still running. Stop it and quit?"):
                 return
-            self.process.terminate()
+            self._stop_job()
         if self._confirm_discard():
+            self._save_server_settings()
+            self.disconnect(ask=False)
+            if self.askpass_dir:
+                shutil.rmtree(self.askpass_dir, ignore_errors=True)
             self.root.destroy()
 
 

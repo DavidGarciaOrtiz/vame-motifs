@@ -162,6 +162,7 @@ The form is saved automatically before each command, so what runs is always what
 | *Stop* | Ends the running command (asks first) |
 | *Open output folder* | Opens the output folder in Finder / Explorer |
 | *Clear* | Empties the output panel |
+| *On GPU server* | Runs the commands on the server set in the *GPU server* tab (see below) |
 
 **Changing settings later** works as in the terminal: a new number of motifs or method,
 just *Run all* again; a change in the *Advanced* tab, alignment, exclusions or minimum
@@ -170,7 +171,49 @@ confidence, tick *Force* and *Run all* (the model is retrained).
 The window only runs `vame-motifs <command> -c experiment.yaml` for you, so results, run
 records and exit codes are identical to the terminal, and an `experiment.yaml` saved
 from the window can be used directly with the CLI (for example on the cluster).
-It needs a desktop: on a Slurm cluster, use the commands below.
+It needs a desktop: on a Slurm cluster, use the commands below, or run the window on your
+computer and train on the server, as follows.
+
+**Training on a GPU server (SSH)**
+
+Training is slow without a GPU. The window can run the commands on a server you can reach
+with SSH, while you keep working on your computer:
+
+1. Install vame-motifs on the server too (section 1), and note the path of that
+   environment's Python, e.g. `~/miniconda3/envs/vame/bin/python`.
+2. In the **GPU server** tab, fill in:
+
+   | Field | Example | |
+   |---|---|---|
+   | Server | `me@gpu.example.org` | or a `Host` name from `~/.ssh/config` |
+   | Port | | empty = 22 |
+   | Key file | `~/.ssh/id_ed25519` | empty = your default SSH key |
+   | Jump host | `me@login.example.org` | optional: a login node to go through (`ssh -J`) |
+   | Folder on server | `vame-motifs/exp1` | where the experiment goes; relative = in your home folder |
+   | Python on server | `~/miniconda3/envs/vame/bin/python` | the Python with vame-motifs installed |
+   | Run prefix | `srun --gres=gpu:1 -p gpu` | optional: on a Slurm cluster, to run on a GPU node |
+
+3. Click **Connect**. This opens one SSH connection (through the jump host, if set) and keeps
+   it open as a tunnel that every later step goes through, so a password or two-factor code
+   is asked only once, in a small window. With an SSH key and no password, connecting first
+   is optional.
+4. Tick **On GPU server** in the *Run* box and use the buttons as usual.
+
+Each command then runs in three steps, all shown in the output panel:
+
+- **upload**: the experiment file, and, with *Copy pose files and videos…* ticked, the pose
+  files and videos (only what changed, with `rsync`);
+- **run**: `vame-motifs <command> -c experiment.yaml` on the server, with its output streamed
+  live; *Stop* ends it on the server too;
+- **download**: the output folder, back next to your experiment file, so *Open output folder*
+  shows the results (even after a failed command, for its run record).
+
+Paths that are absolute in the experiment file (e.g. `/pool01/...`) are taken to be paths on
+the server and are not copied: point them at data already on the server to skip uploading it.
+The server settings are saved for your user in `~/.config/vame-motifs/gui.json`, not in the
+experiment file, and each experiment remembers its own folder on the server. This needs the
+`ssh` and `rsync` programs (included in macOS and Linux); *Connect* is not available on Windows,
+where an SSH key is needed instead.
 
 ### On a Slurm cluster (e.g. Pedraforca)
 
@@ -241,6 +284,8 @@ that produced it.
 src/vame_motifs/
 ├── cli.py          commands: parse arguments, call functions, print, exit codes
 ├── gui.py          window: edits the experiment YAML, runs the cli.py commands
+├── remote.py       the ssh/rsync command lines that run them on a GPU server
+├── askpass.py      the password window ssh uses when the window connects
 ├── config.py       load_config()   experiment YAML -> ExperimentConfig
 ├── io.py           read_dlc_csv()  DLC CSV -> PoseFile
 ├── validation.py   validate()      checks before any VAME step (uses config.py + io.py)
