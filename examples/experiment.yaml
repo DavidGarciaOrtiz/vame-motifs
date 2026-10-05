@@ -5,7 +5,7 @@
 
 input:
   pose_files: /pool01/projects/abante_lab/dopamap_beh/results_analysis/01022023_001_16236-62755DLC_Resnet50_Test-ExampleSep16shuffle1_snapshot_best-84_filtered.csv        # a folder of DeepLabCut .csv files, or one .csv file
-  # videos: data/videos/          # optional: folder of raw .mp4/.avi videos, or one file; needed for 'vame-motifs videos'
+  videos: /pool01/projects/abante_lab/dopamap_beh/results_analysis/01022023_001_16236-62755DLC_Resnet50_Test-ExampleSep16shuffle1_snapshot_best-84_filtered_p60_labeled.mp4       # optional: folder of raw .mp4/.avi videos, or one file; needed for 'vame-motifs videos'
   fps: 30                         # frame rate of the recordings
 
 keypoints:                        # names exactly as in the CSV header ('validate' lists them)
@@ -29,3 +29,4 @@ advanced:
   time_window: 30                 # frames per window; also sets the label offset in the CSVs
   zdims: 30                       # size of the latent space
   seed: 42                        # same seed + same data = same motifs
+  community_cut_tree: 3           # how finely motifs are grouped into communities for 'videos' folders (higher = more, smaller communities)

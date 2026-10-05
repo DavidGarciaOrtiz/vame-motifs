@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 from conftest import write_video, write_yaml
 
@@ -33,3 +34,52 @@ def test_has_motif_videos_false_until_clips_exist(experiment):
         video_dir.mkdir(parents=True)
         (video_dir / f"{pose_path.stem}-motif_0.mp4").write_bytes(b"")
     assert pipeline.has_motif_videos()
+
+
+def _write_community_bag(pipeline: VamePipeline, algorithm: str, bag: list[list[int]]) -> None:
+    bag_path = pipeline.community_bag_file(algorithm)
+    bag_path.parent.mkdir(parents=True)
+    np.save(bag_path, np.array(bag, dtype=object))
+
+
+def test_has_community_false_until_bag_exists(experiment):
+    cfg = load_config(experiment)
+    pipeline = VamePipeline(cfg)
+    assert not pipeline.has_community()
+
+    _write_community_bag(pipeline, "hmm", [[0, 1], [2, 3, 4]])
+    assert pipeline.has_community()
+
+
+def test_motif_to_community_maps_each_motif_to_its_bag_index(experiment):
+    pipeline = VamePipeline(load_config(experiment))
+    _write_community_bag(pipeline, "hmm", [[0, 2], [1, 3, 4]])
+
+    assert pipeline._motif_to_community("hmm") == {0: 0, 2: 0, 1: 1, 3: 1, 4: 1}
+
+
+def test_group_videos_by_community_moves_clips_into_community_subfolders(experiment):
+    cfg = load_config(experiment)
+    pipeline = VamePipeline(cfg)
+    _write_community_bag(pipeline, "hmm", [[0, 2], [1, 3, 4]])
+
+    for pose_path in cfg.pose_files:
+        video_dir = pipeline.motif_videos_dir(pose_path.stem, "hmm")
+        video_dir.mkdir(parents=True)
+        for motif in range(5):
+            (video_dir / f"{pose_path.stem}-motif_{motif}.mp4").write_bytes(b"")
+
+    pipeline._group_videos_by_community("hmm")
+
+    for pose_path in cfg.pose_files:
+        video_dir = pipeline.motif_videos_dir(pose_path.stem, "hmm")
+        assert not list(video_dir.glob("*.mp4"))  # nothing left flat at the top level
+        assert sorted(p.name for p in (video_dir / "community_0").glob("*.mp4")) == [
+            f"{pose_path.stem}-motif_0.mp4",
+            f"{pose_path.stem}-motif_2.mp4",
+        ]
+        assert sorted(p.name for p in (video_dir / "community_1").glob("*.mp4")) == [
+            f"{pose_path.stem}-motif_1.mp4",
+            f"{pose_path.stem}-motif_3.mp4",
+            f"{pose_path.stem}-motif_4.mp4",
+        ]

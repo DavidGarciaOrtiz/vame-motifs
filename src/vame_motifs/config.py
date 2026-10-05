@@ -39,11 +39,13 @@ class ExperimentConfig:
     videos: list[Path] = field(default_factory=list)
     output: Path = Path("outputs")
     project_name: str = "vame_project"
+    
     # advanced: sensible defaults, most researchers never change them
     max_epochs: int = 100
     time_window: int = 30
     zdims: int = 30
     seed: int = 42
+    community_cut_tree: int = 3
 
     @property
     def algorithms(self) -> list[str]:
@@ -80,11 +82,18 @@ def _find_pose_files(pose_path: Path) -> list[Path]:
 
 
 def _find_videos(video_path: Path, pose_files: list[Path]) -> list[Path]:
-    """Raw videos paired to ``pose_files``, one per file, in the same order.
+    """Videos paired to ``pose_files``, one per file, in the same order.
 
-    DeepLabCut names a pose CSV after the video it analysed plus its own
-    suffix (``session1.mp4`` -> ``session1DLC_resnet50_....csv``), so each
-    video is matched to the pose file whose name it is the longest prefix of.
+    Two DeepLabCut naming patterns are supported:
+    - raw video: the video name is a prefix of the pose CSV's stem
+      (``session1.mp4`` -> ``session1DLC_resnet50_....csv``).
+    - labeled video: the pose CSV's stem is a prefix of the video name,
+      with DLC's own suffix appended
+      (``session1DLC_resnet50_..._filtered.csv`` ->
+      ``session1DLC_resnet50_..._filtered_p60_labeled.mp4``).
+
+    Each pose file is matched to the video whose stem is closest to its
+    own (smallest length difference), in whichever direction applies.
     """
     if not video_path.exists():
         raise ConfigError(f"input.videos: {video_path} does not exist")
@@ -99,14 +108,19 @@ def _find_videos(video_path: Path, pose_files: list[Path]) -> list[Path]:
 
     videos = []
     for pose_path in pose_files:
-        matches = [v for v in candidates if pose_path.stem.startswith(v.stem)]
+        matches = [
+            v for v in candidates
+            if pose_path.stem.startswith(v.stem) or v.stem.startswith(pose_path.stem)
+        ]
         if not matches:
             raise ConfigError(
                 f"input.videos: no video matches pose file '{pose_path.name}' "
-                f"(expected a video whose file name is a prefix of '{pose_path.stem}', "
-                "i.e. the one DeepLabCut analysed)"
+                f"(expected either the raw video DeepLabCut analysed, whose file name "
+                f"is a prefix of '{pose_path.stem}', or a labeled video whose file name "
+                f"starts with '{pose_path.stem}')"
             )
-        videos.append(max(matches, key=lambda v: len(v.stem)))  # most specific prefix wins
+        # most specific match wins: smallest stem-length difference, in either direction
+        videos.append(min(matches, key=lambda v: abs(len(v.stem) - len(pose_path.stem))))
 
     reused = {v for v in videos if videos.count(v) > 1}
     if reused:
@@ -148,6 +162,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             time_window=int(adv.get("time_window", 30)),
             zdims=int(adv.get("zdims", 30)),
             seed=int(adv.get("seed", 42)),
+            community_cut_tree=int(adv.get("community_cut_tree", 3)),
         )
     except ConfigError:
         raise
@@ -168,6 +183,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
         raise ConfigError(f"advanced.max_epochs must be at least {MIN_EPOCHS}")
     if cfg.time_window < 2:
         raise ConfigError("advanced.time_window must be at least 2")
+    if cfg.community_cut_tree < 0:
+        raise ConfigError("advanced.community_cut_tree must be a non-negative integer")
     if cfg.align_center == cfg.align_direction:
         raise ConfigError("keypoints.align_center and keypoints.align_direction must be different body parts")
     if {cfg.align_center, cfg.align_direction} & set(cfg.exclude):

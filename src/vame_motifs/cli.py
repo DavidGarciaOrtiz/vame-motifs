@@ -7,7 +7,7 @@ notebooks can call it directly.
 Typical use::
 
     vame-motifs validate -c experiment.yaml     # seconds: check the CSVs and the YAML
-    vame-motifs run      -c experiment.yaml     # everything: prepare, train, segment, export, videos
+    vame-motifs run      -c experiment.yaml     # everything: prepare, train, segment, export, communities, videos
 
 Exit codes: 0 success, 1 a problem with the input or a missing step
 (short message, no traceback), 2 wrong command-line arguments.
@@ -75,9 +75,14 @@ def cmd_export(cfg: ExperimentConfig, args) -> None:
     print(f"Wrote {len(written)} file(s) to {cfg.motifs_dir}")
 
 
+def cmd_communities(cfg: ExperimentConfig, args) -> None:
+    VamePipeline(cfg).community()
+    print(f"Wrote community groupings under {cfg.output / cfg.project_name / 'results' / 'community_cohort'}")
+
+
 def cmd_videos(cfg: ExperimentConfig, args) -> None:
     VamePipeline(cfg).motif_videos()
-    print(f"Wrote motif videos under {cfg.output / cfg.project_name / 'results'}")
+    print(f"Wrote motif videos (grouped by community) under {cfg.output / cfg.project_name / 'results'}")
 
 
 def cmd_run(cfg: ExperimentConfig, args) -> None:
@@ -103,6 +108,7 @@ def cmd_status(cfg: ExperimentConfig, args) -> None:
         n_csv = len(list((cfg.motifs_dir / algorithm).glob("*_motifs.csv")))
         print(f"  export   : {algorithm}: {n_csv}/{len(cfg.pose_files)} motif CSVs")
     if cfg.videos:
+        print(f"  community: {mark(pipeline.has_community())}")
         print(f"  videos   : {mark(pipeline.has_motif_videos())}")
 
 
@@ -114,8 +120,9 @@ COMMANDS: dict[str, tuple[Callable, str, bool]] = {
     "train":    (cmd_train,    "Train and evaluate the VAME model (slow; GPU)", True),
     "segment":  (cmd_segment,  "Assign a motif to every time window", True),
     "export":   (cmd_export,   "Write motif CSVs + motif usage summary", False),
-    "videos":   (cmd_videos,   "Cut a short .mp4 per motif, per session, from input.videos", True),
-    "run":      (cmd_run,      "validate -> prepare -> train -> segment -> export -> videos", True),
+    "communities": (cmd_communities, "Group motifs with similar transitions into communities", True),
+    "videos":   (cmd_videos,   "Cut a short .mp4 per motif, per session, from input.videos, grouped by community", True),
+    "run":      (cmd_run,      "validate -> prepare -> train -> segment -> export -> communities -> videos", True),
     "status":   (cmd_status,   "Show which steps are done", False),
 }
 

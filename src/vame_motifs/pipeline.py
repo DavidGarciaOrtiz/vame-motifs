@@ -8,7 +8,8 @@ VAME's config and calls VAME's functions in order:
              + training set
     train    train + evaluate the model (the only slow, GPU-worthy step)
     segment  motif segmentation (hmm and/or kmeans)
-    videos   cut a short .mp4 per motif per session from input.videos (optional)
+    videos   cut a short .mp4 per motif per session from input.videos (optional),
+             grouped into per-community folders (runs community analysis first)
 
 Whether a step is done is decided by the files it must produce, not by VAME's
 states/states.json: VAME logs some failures and still records "success".
@@ -19,6 +20,8 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+
+import numpy as np
 
 from vame_motifs.config import ExperimentConfig
 
@@ -161,7 +164,30 @@ class VamePipeline:
         if missing:
             raise PipelineError(f"VAME segmentation did not produce {missing[0]}. See {self._log('pose_segmentation')}")
 
-    # --- step 7: motif videos (optional; needs input.videos) ------------
+    # --- step 7: communities (groups of motifs with similar transitions) -
+    def community_bag_file(self, algorithm: str) -> Path:
+        """Where VAME saves the motif -> community grouping (one list of motif indices per community)."""
+        n = self.cfg.n_clusters
+        return self.project_path / "results" / "community_cohort" / f"{algorithm}-{n}" / "cohort_community_bag.npy"
+
+    def has_community(self) -> bool:
+        return all(self.community_bag_file(algorithm).exists() for algorithm in self.cfg.algorithms)
+
+    def community(self) -> None:
+        """Group motifs with similar transitions into higher-level communities, across all sessions."""
+        if self.missing_labels():
+            raise PipelineError("No motif labels yet. Run 'segment' first.")
+        vame = _import_vame()
+        vame.community(config=self.config, cut_tree=self.cfg.community_cut_tree)
+        missing = [a for a in self.cfg.algorithms if not self.community_bag_file(a).exists()]
+        if missing:
+            raise PipelineError(f"VAME did not create a community grouping for '{missing[0]}'. See {self._log('community')}")
+
+    def _motif_to_community(self, algorithm: str) -> dict[int, int]:
+        bag = np.load(self.community_bag_file(algorithm), allow_pickle=True)
+        return {int(motif): community for community, motifs in enumerate(bag) for motif in motifs}
+
+    # --- step 8: motif videos (optional; needs input.videos) ------------
     def motif_videos_dir(self, session: str, algorithm: str) -> Path:
         """Where VAME saves a session's motif clips."""
         n = self.cfg.n_clusters
@@ -169,19 +195,38 @@ class VamePipeline:
 
     def has_motif_videos(self) -> bool:
         return all(
-            any(self.motif_videos_dir(p.stem, algorithm).glob("*.mp4"))
+            any(self.motif_videos_dir(p.stem, algorithm).glob("**/*.mp4"))
             for algorithm in self.cfg.algorithms
             for p in self.cfg.pose_files
         )
 
+    def _group_videos_by_community(self, algorithm: str) -> None:
+        """Move each session's flat motif clips into community_<i>/ subfolders of cluster_videos/."""
+        motif_to_community = self._motif_to_community(algorithm)
+        for pose_path in self.cfg.pose_files:
+            session = pose_path.stem
+            clips_dir = self.motif_videos_dir(session, algorithm)
+            for clip in clips_dir.glob(f"{session}-motif_*.mp4"):
+                motif = int(clip.stem.rsplit("_", 1)[-1])
+                community = motif_to_community.get(motif)
+                if community is None:
+                    continue  # motif had no frames, so VAME never wrote a clip for it
+                dest_dir = clips_dir / f"community_{community}"
+                dest_dir.mkdir(exist_ok=True)
+                clip.rename(dest_dir / clip.name)
+
     def motif_videos(self) -> None:
-        """One short .mp4 per motif, per session, cut from input.videos."""
+        """One short .mp4 per motif, per session, cut from input.videos and grouped by community."""
         if not self.cfg.videos:
             raise PipelineError("No raw videos configured (input.videos). Motif videos need the original recordings.")
         if self.missing_labels():
             raise PipelineError("No motif labels yet. Run 'segment' first.")
+        if not self.has_community():
+            self.community()
         vame = _import_vame()
         vame.motif_videos(config=self.config)
+        for algorithm in self.cfg.algorithms:
+            self._group_videos_by_community(algorithm)
         if not self.has_motif_videos():
             raise PipelineError(f"VAME did not create any motif videos. See {self._log('motif_videos')}")
 
@@ -191,7 +236,8 @@ class VamePipeline:
 
         Segmentation always runs: VAME itself skips results that already exist
         for the current n_clusters, so a new n_clusters is segmented without
-        retraining. Motif videos only run when input.videos was set.
+        retraining. Motif videos (and the community grouping they need) only
+        run when input.videos was set.
         """
         self.init()
         if force or not self.trainset_path.exists():
