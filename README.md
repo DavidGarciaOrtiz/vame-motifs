@@ -107,6 +107,71 @@ Exit codes: `0` success, `1` a problem with the input or a missing step (printed
 `Error:` line, no traceback), `2` wrong command-line arguments. This makes the
 command safe to use in scripts and Slurm jobs.
 
+### With the window (GUI)
+
+Everything above can also be done from a window, without the terminal or editing YAML by hand.
+It is installed with the package; start it with:
+
+```bash
+conda activate vame
+vame-motifs-gui                    # empty form
+vame-motifs-gui experiment.yaml    # or open an existing experiment file
+```
+
+(`python -m vame_motifs.gui` works too.) The window uses Tkinter, which comes with
+conda's Python; with a Homebrew Python on macOS you may need `brew install python-tk`.
+
+The window has three parts: the experiment form (left), the commands (right) and their
+output (bottom). The bar at the top shows which experiment file is open, with *New*,
+*Open…*, *Save* and *Save as…*. A `*` in the title means there are unsaved changes.
+
+**Step by step**
+
+1. **Choose where the experiment file lives.** Click *Save as…* and save
+   `experiment.yaml` next to your data (or *Open…* an existing one). Do this first:
+   the paths you pick are stored relative to this file.
+2. **Data tab.** With *File…* or *Folder…*, choose the pose files (a folder of
+   DeepLabCut `.csv` files, or one file) and, optionally, the raw videos (only needed
+   for the `videos` step). Set the frame rate and the output folder.
+3. **Body parts tab.** Click *Read body parts from pose files*: the names are read from
+   the first CSV's header. Pick *Align center* and *Align direction* from the lists, and
+   select in *Exclude* any body parts to leave out (click to select or unselect).
+4. **Motifs tab.** Set the number of motifs, the method (`hmm`, `kmeans` or `both`) and
+   the minimum DLC confidence.
+5. **Advanced tab.** Optional; the defaults are the same as in the YAML above. Leave
+   them as they are unless you know you need to change them.
+6. **Check the data.** Click `validate`. The output panel lists the body parts and warns
+   about poorly tracked ones. Fix any `Error:` line (shown in red) before going on.
+7. **Run.** Click *Run all*. It runs every step in order and skips steps already done.
+   Training is slow: the window stays usable, and the status line at the bottom says
+   which command is running. *Stop* ends it.
+8. **Look at the results.** When the output panel shows `[Finished]`, click
+   *Open output folder* (see [4. Outputs](#4-outputs)). *Status* shows which steps are done.
+
+The form is saved automatically before each command, so what runs is always what you see.
+
+**Buttons and options**
+
+| Control | What it does |
+|---|---|
+| *Run all* | `vame-motifs run`: all steps, skipping those already done |
+| `validate` … `videos` | One step at a time, the same commands as in the table above |
+| *Status* | Which steps are done |
+| *Force (redo steps)* | Adds `--force` to *Run all* and `segment`: redo the steps instead of skipping them |
+| *Verbose* | Adds `-v`: more detailed output |
+| *Stop* | Ends the running command (asks first) |
+| *Open output folder* | Opens the output folder in Finder / Explorer |
+| *Clear* | Empties the output panel |
+
+**Changing settings later** works as in the terminal: a new number of motifs or method,
+just *Run all* again; a change in the *Advanced* tab, alignment, exclusions or minimum
+confidence, tick *Force* and *Run all* (the model is retrained).
+
+The window only runs `vame-motifs <command> -c experiment.yaml` for you, so results, run
+records and exit codes are identical to the terminal, and an `experiment.yaml` saved
+from the window can be used directly with the CLI (for example on the cluster).
+It needs a desktop: on a Slurm cluster, use the commands below.
+
 ### On a Slurm cluster (e.g. Pedraforca)
 
 Everything runs on the server; no GUI step is involved. Submit the slow command as a job:
@@ -175,6 +240,7 @@ that produced it.
 ```
 src/vame_motifs/
 ├── cli.py          commands: parse arguments, call functions, print, exit codes
+├── gui.py          window: edits the experiment YAML, runs the cli.py commands
 ├── config.py       load_config()   experiment YAML -> ExperimentConfig
 ├── io.py           read_dlc_csv()  DLC CSV -> PoseFile
 ├── validation.py   validate()      checks before any VAME step (uses config.py + io.py)
