@@ -17,6 +17,26 @@ the buttons there: same run records, and on the GPU server when that is ticked.
 
 Videos are read with OpenCV and maps drawn with matplotlib, both installed
 with VAME.
+
+How the file is organised
+-------------------------
+1. Small helpers: ``colour`` (a colour per number) and ``bouts``.
+2. ``Results``: reads what the analysis produced (labels, tree, map, clips).
+   No window code, so it can be used and tested on its own.
+3. ``VideoPlayer``: a reusable video player widget (used three times).
+4. ``Explorer``: the window itself. ``__init__`` builds the four tabs with the
+   ``_build_*`` methods; ``reload`` reads the results again and calls the
+   ``_refresh_*`` methods, which fill the tabs with them. The other methods
+   respond to clicks.
+
+Words used below:
+- a *bout* is one uninterrupted stretch of frames in the same motif (or community);
+- a *mask* is an array of True/False, one per frame (True: the frame counts);
+- *window* (in VAME's sense) is the group of ``time_window`` frames that gets one motif.
+
+Libraries: OpenCV (``cv2``) reads video frames; Pillow (``PIL``) turns them
+into images Tk can show; matplotlib draws the tree and the map inside the
+window (``FigureCanvasTkAgg`` is the bridge between matplotlib and Tk).
 """
 
 from __future__ import annotations
@@ -41,20 +61,30 @@ from vame_motifs.export import ExportError, labels_to_frames
 from vame_motifs.io import count_frames
 from vame_motifs.pipeline import VamePipeline
 
+# Only for type hints: gui.py imports this module, so importing gui here for
+# real would make each module wait for the other ("circular import").
 if TYPE_CHECKING:
     from vame_motifs.gui import App
 
 # tab20's strong colours first, then the light ones: neighbouring numbers look different
 PALETTE = [colormaps["tab20"](i) for i in [*range(0, 20, 2), *range(1, 20, 2)]]
-NO_MOTIF = -1
+NO_MOTIF = -1  # stands for "no motif" (window edges) in the integer arrays below
 
 
 def colour(i: int):
-    return PALETTE[int(i) % len(PALETTE)]
+    """The colour of motif/community number ``i`` (the palette repeats after 20)."""
+    return PALETTE[int(i) % len(PALETTE)]  # % : remainder of the division, so it wraps around
 
 
 def bouts(mask: np.ndarray) -> np.ndarray:
-    """(first, last) frame of each run of True values, in order."""
+    """(first, last) frame of each run of True values, in order.
+
+    Example: [F, T, T, F, T] -> [[1, 2], [4, 4]].
+
+    How: put a 0 at both ends and take the difference between neighbours.
+    A run of 1s then starts where the difference is +1 and ends just before
+    the place where it is -1.
+    """
     edges = np.diff(np.concatenate([[0], np.asarray(mask, dtype=int), [0]]))
     return np.column_stack([np.flatnonzero(edges == 1), np.flatnonzero(edges == -1) - 1])
 
@@ -67,18 +97,21 @@ class Results:
 
     def __init__(self, cfg: ExperimentConfig, algorithm: str):
         self.cfg, self.algorithm = cfg, algorithm
-        self.pipeline = VamePipeline(cfg)
+        self.pipeline = VamePipeline(cfg)  # knows where each result file is
         self.sessions = [p.stem for p in cfg.pose_files]
-        self.pose_files = dict(zip(self.sessions, cfg.pose_files))
+        self.pose_files = dict(zip(self.sessions, cfg.pose_files))  # session -> pose file
+        # session -> video. zip stops at the shorter list, so with no videos this is empty.
         self.videos: dict[str, Path] = dict(zip(self.sessions, cfg.videos))
-        self._frame_motifs: dict[str, np.ndarray] = {}
+        self._frame_motifs: dict[str, np.ndarray] = {}  # cache: computed once per session
         self.tree = self._load_tree()
         self.bag = self._load_bag()
+        # The map: a dictionary of arrays (see VamePipeline.umap), or None.
         self.umap = dict(np.load(self.pipeline.umap_path)) if self.pipeline.umap_path.exists() else None
         self.point_motif = self._point_motifs()
 
     # --- motifs ---------------------------------------------------------
     def window_labels(self, session: str) -> np.ndarray | None:
+        """VAME's motif labels for a session, one per time window; None if not segmented yet."""
         path = self.pipeline.label_file(session, self.algorithm)
         return np.load(path) if path.exists() else None
 
@@ -90,6 +123,7 @@ class Results:
                 return None
             n_frames = count_frames(self.pose_files[session])
             per_frame = labels_to_frames(labels, n_frames, self.cfg.time_window)
+            # Replace "missing" by NO_MOTIF, so the result is a plain integer array.
             self._frame_motifs[session] = per_frame.fillna(NO_MOTIF).to_numpy(dtype=int)
         return self._frame_motifs[session]
 
@@ -100,10 +134,11 @@ class Results:
             labels = self.window_labels(session)
             if labels is not None:
                 counts += np.bincount(labels.astype(int), minlength=self.cfg.n_clusters)[: self.cfg.n_clusters]
-        return counts / counts.sum() if counts.sum() else counts
+        return counts / counts.sum() if counts.sum() else counts  # avoid dividing by 0
 
     # --- communities ----------------------------------------------------
     def _load_tree(self):
+        """VAME's motif tree, saved next to its community grouping; None before 'communities'."""
         path = self.pipeline.community_bag_file(self.algorithm).parent / "tree.graphml"
         return communities.load_tree(path) if path.exists() else None
 
@@ -115,9 +150,11 @@ class Results:
         return [[int(m) for m in motifs] for motifs in np.load(path, allow_pickle=True)]
 
     def community_of(self) -> dict[int, int]:
+        """motif -> community, for the saved (applied) communities."""
         return communities.motif_to_community(self.bag) if self.bag else {}
 
     def names(self) -> dict[int, str]:
+        """community -> name, for the saved communities."""
         return communities.read_labels(self.cfg, self.algorithm, self.bag) if self.bag else {}
 
     # --- map and clips --------------------------------------------------
@@ -125,20 +162,24 @@ class Results:
         """Motif of every point of the UMAP (NO_MOTIF if its recording has no labels)."""
         if self.umap is None:
             return None
-        motifs = np.full(len(self.umap["window"]), NO_MOTIF)
+        motifs = np.full(len(self.umap["window"]), NO_MOTIF)  # start with "no motif" everywhere
         for i, session in enumerate(self.umap["sessions"]):
             labels = self.window_labels(str(session))
-            points = self.umap["session"] == i
+            points = self.umap["session"] == i  # mask: the points of this session
             if labels is not None:
                 windows = self.umap["window"][points]
-                ok = windows < len(labels)
+                ok = windows < len(labels)  # guard against a map made from older labels
+                # flatnonzero(points): the positions of this session's points;
+                # each gets the label of its window.
                 motifs[np.flatnonzero(points)[ok]] = labels[windows[ok]]
         return motifs
 
     def clips(self, session: str) -> dict[int, Path]:
+        """motif -> its clip (from 'videos') for this session."""
         return self.pipeline.motif_clips(session, self.algorithm)
 
     def gifs(self) -> list[Path]:
+        """The GIFs made so far, newest first."""
         return sorted((self.cfg.output / "gifs").glob("*.gif"), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
@@ -149,23 +190,32 @@ class VideoPlayer(ttk.Frame):
     """Plays a video or GIF in the window: play/pause, frame steps, a position slider, speed.
 
     ``describe(frame)`` gives the text shown under the picture (e.g. the frame's motif).
+
+    How playing works: Tk cannot wait in a loop, so each frame is shown by
+    ``_tick``, which then asks Tk (``after``) to call it again in 1/fps seconds.
+    Pause cancels the next call. Frames are read with OpenCV's VideoCapture,
+    which reads the video one frame after another, or jumps to a frame (seek).
     """
 
     SPEEDS = ("0.25", "0.5", "1", "2", "4")
 
     def __init__(self, parent, width: int = 520, height: int = 400):
         super().__init__(parent)
-        self.capture: cv2.VideoCapture | None = None
-        self.n_frames, self.fps, self.frame = 0, 30.0, 0
+        self.capture: cv2.VideoCapture | None = None  # the open video, if any
+        self.n_frames, self.fps, self.frame = 0, 30.0, 0  # length, frame rate, current frame
+        # playing: is it playing; _job: the scheduled next _tick (to cancel it);
+        # _photo: the Tk image on screen; _image: the current frame as an array.
         self.playing, self._job, self._photo, self._image = False, None, None, None
-        self._sliding = False
+        self._sliding = False  # True while the code (not the user) moves the slider
         self.describe: Callable[[int], str] | None = None
-        self.on_frame: Callable[[int], None] | None = None
+        self.on_frame: Callable[[int], None] | None = None  # optional: called on every new frame
 
+        # A Canvas is a drawing area; the frames are drawn on it, scaled to fit.
         self.screen = tk.Canvas(self, width=width, height=height, background="black", highlightthickness=0)
         self.screen.grid(row=0, column=0, columnspan=7, sticky="nsew")
+        # "<Configure>": the canvas changed size (window resized) -> draw again.
         self.screen.bind("<Configure>", lambda _: self._draw())
-        self.message = "No video"
+        self.message = "No video"  # text shown when there is no picture
 
         self.position = tk.DoubleVar()
         self.slider = ttk.Scale(self, from_=0, to=1, variable=self.position, command=self._slide)
@@ -179,12 +229,13 @@ class VideoPlayer(ttk.Frame):
         ttk.Combobox(self, textvariable=self.speed, values=self.SPEEDS, width=5, state="readonly").grid(row=2, column=4)
         self.time_label = ttk.Label(self, text="", width=24, anchor="e")
         self.time_label.grid(row=2, column=6, sticky="e")
-        self.info = ttk.Label(self, text="", anchor="w")
+        self.info = ttk.Label(self, text="", anchor="w")  # the describe() text
         self.info.grid(row=3, column=0, columnspan=7, sticky="ew")
         self.columnconfigure(5, weight=1)
         self.rowconfigure(0, weight=1)
 
     def open(self, path: Path, frame: int = 0, describe: Callable[[int], str] | None = None) -> bool:
+        """Open a video (or GIF) and show ``frame``. Returns False if it cannot be opened."""
         self.close()
         self.describe = describe
         if not Path(path).exists():
@@ -196,12 +247,13 @@ class VideoPlayer(ttk.Frame):
             return False
         self.capture = capture
         self.n_frames = max(int(capture.get(cv2.CAP_PROP_FRAME_COUNT)), 1)
-        self.fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
+        self.fps = capture.get(cv2.CAP_PROP_FPS) or 30.0  # some files don't say: assume 30
         self.slider.configure(to=max(self.n_frames - 1, 1))
         self.seek(frame)
         return True
 
     def close(self) -> None:
+        """Stop and release the video."""
         self.pause()
         if self.capture is not None:
             self.capture.release()
@@ -209,24 +261,28 @@ class VideoPlayer(ttk.Frame):
         self._blank("No video")
 
     def _blank(self, message: str) -> None:
+        """Show a message instead of a picture."""
         self._image, self.message = None, message
         self.time_label.configure(text="")
         self.info.configure(text="")
         self._draw()
 
     def seek(self, frame: int) -> None:
+        """Jump to a frame (clamped to the video's length) and show it."""
         if self.capture is None:
             return
         frame = int(min(max(frame, 0), self.n_frames - 1))
-        self.capture.set(cv2.CAP_PROP_POS_FRAMES, frame)
+        self.capture.set(cv2.CAP_PROP_POS_FRAMES, frame)  # the next read() returns this frame
         self._read(frame)
 
     def _read(self, frame: int) -> bool:
+        """Read the next frame from the video, show it as frame number ``frame``, update the labels."""
         ok, image = self.capture.read()
         if not ok:
-            return False
+            return False  # end of the video, or an unreadable frame
         self.frame, self._image = frame, image
         self._draw()
+        # Move the slider without making it seek (see _slide).
         self._sliding = True
         self.position.set(frame)
         self._sliding = False
@@ -237,23 +293,27 @@ class VideoPlayer(ttk.Frame):
         return True
 
     def _draw(self) -> None:
+        """Draw the current frame (or the message) centred on the canvas, as large as fits."""
         self.screen.delete("all")
         width, height = max(self.screen.winfo_width(), 2), max(self.screen.winfo_height(), 2)
         if self._image is None:
             self.screen.create_text(width / 2, height / 2, text=self.message, fill="white", width=width - 20)
             return
-        h, w = self._image.shape[:2]
-        scale = min(width / w, height / h)
+        h, w = self._image.shape[:2]  # an image array is (height, width, colours)
+        scale = min(width / w, height / h)  # keep the proportions
         size = (max(int(w * scale), 1), max(int(h * scale), 1))
+        # OpenCV stores colours as blue-green-red; Pillow and Tk expect red-green-blue.
         rgb = cv2.cvtColor(cv2.resize(self._image, size, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2RGB)
         self._photo = ImageTk.PhotoImage(Image.fromarray(rgb))  # kept: Tk does not hold a reference
         self.screen.create_image(width / 2, height / 2, image=self._photo)
 
     def _slide(self, _value) -> None:
+        """The slider moved: if the user moved it, jump there."""
         if not self._sliding and self.capture is not None:
             self.seek(round(self.position.get()))
 
     def toggle(self) -> None:
+        """Play / Pause button. At the end of the video, Play starts again from the beginning."""
         if self.playing:
             self.pause()
         elif self.capture is not None:
@@ -264,6 +324,7 @@ class VideoPlayer(ttk.Frame):
             self._tick()
 
     def pause(self) -> None:
+        """Stop playing (cancel the scheduled next frame)."""
         self.playing = False
         self.play_button.configure(text="▶ Play")
         if self._job is not None:
@@ -271,16 +332,19 @@ class VideoPlayer(ttk.Frame):
             self._job = None
 
     def step(self, frames: int) -> None:
+        """◀ 1 / 1 ▶ buttons: pause and move by ``frames`` frames."""
         self.pause()
         self.seek(self.frame + frames)
 
     def _tick(self) -> None:
+        """Show the next frame and schedule the following one (this is the playing loop)."""
         self._job = None
         if not self.playing or self.capture is None:
             return
         if self.frame >= self.n_frames - 1 or not self._read(self.frame + 1):
-            self.pause()
+            self.pause()  # reached the end
             return
+        # Delay in milliseconds between frames: 1000 / (frames per second x speed).
         self._job = self.after(max(1, int(1000 / (self.fps * float(self.speed.get())))), self._tick)
 
 
@@ -288,7 +352,12 @@ class VideoPlayer(ttk.Frame):
 # The window
 # ======================================================================
 class Explorer(tk.Toplevel):
-    TABS = ("recordings", "map", "clips", "gif")
+    """The 'Explore results' window. ``app``: the main window (gui.App); ``cfg``: the experiment.
+
+    A Toplevel is a second window belonging to the same program.
+    """
+
+    TABS = ("recordings", "map", "clips", "gif")  # names used by show(), in tab order
 
     def __init__(self, app: App, cfg: ExperimentConfig):
         super().__init__(app.root)
@@ -298,6 +367,7 @@ class Explorer(tk.Toplevel):
         self.minsize(1000, 680)
         self.protocol("WM_DELETE_WINDOW", self.close)
 
+        # Top bar: which segmentation (hmm/kmeans) to show, Reload, and a summary.
         bar = ttk.Frame(self, padding=(8, 8, 8, 0))
         bar.pack(fill="x")
         ttk.Label(bar, text="Segmentation").pack(side="left")
@@ -316,14 +386,16 @@ class Explorer(tk.Toplevel):
         self._build_map()
         self._build_clips()
         self._build_gif()
-        self.reload(read_config=False)
+        self.reload(read_config=False)  # fill the tabs with the results
 
     def show(self, tab: str) -> None:
+        """Bring the window to the front, on one tab (a name from TABS)."""
         self.notebook.select(self.TABS.index(tab))
-        self.deiconify()
+        self.deiconify()  # un-minimise
         self.lift()
 
     def close(self) -> None:
+        """Close the window (releasing the open videos) and tell the main window."""
         for player in (self.recording_player, self.clip_player, self.gif_player):
             player.close()
         self.app.explorer = None
@@ -353,7 +425,7 @@ class Explorer(tk.Toplevel):
         have.append(f"{len(r.bag)} communities (cut {self.cfg.community_cut_tree})" if r.bag else "no communities yet")
         have.append("motif map" if r.umap is not None else "no motif map yet")
         self.summary.configure(text=" · ".join(have))
-        self.names = r.names()
+        self.names = r.names()  # the names being edited in 'Communities & clips'
         self.picked = None  # a point of the previous map
         self.play_point_button.configure(state="disabled")
         self._refresh_recordings()
@@ -366,9 +438,11 @@ class Explorer(tk.Toplevel):
         if self.app.running:
             messagebox.showinfo("Explore results", "A command is already running: wait for it to finish.", parent=self)
             return
+        # When it ends successfully (exit code 0), read the new results.
         self.app.run_command(command, extra, on_done=lambda code: self.reload() if code == 0 else None)
 
     def _community_name(self, community: int) -> str:
+        """"community 3", or "community 3 'grooming'" when it has a name."""
         name = self.names.get(community, "")
         return f"community {community}" + (f" '{name}'" if name else "")
 
@@ -376,6 +450,7 @@ class Explorer(tk.Toplevel):
     # Recordings: the input videos
     # ==================================================================
     def _build_recordings(self) -> None:
+        """Tab 1: list of recordings (left), video player (right), Find bar (bottom)."""
         tab = ttk.Frame(self.notebook, padding=8)
         self.notebook.add(tab, text="Recordings")
         tab.columnconfigure(1, weight=1)
@@ -393,6 +468,7 @@ class Explorer(tk.Toplevel):
         self.recording_player = VideoPlayer(tab, width=720, height=540)
         self.recording_player.grid(row=0, column=1, sticky="nsew")
 
+        # Find: choose "motif" or "community", then which one, then jump between its bouts.
         find = ttk.Frame(tab)
         find.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Label(find, text="Find").pack(side="left")
@@ -410,6 +486,7 @@ class Explorer(tk.Toplevel):
         self.find_label.pack(side="left", padx=8)
 
     def _refresh_recordings(self) -> None:
+        """Fill the recordings list, keeping the selected one (and its position) if possible."""
         r = self.results
         selected = self._selected_session()
         self.session_list.delete(0, "end")
@@ -422,17 +499,19 @@ class Explorer(tk.Toplevel):
             self._open_recording(keep_frame=selected == r.sessions[index])
 
     def _selected_session(self) -> str | None:
+        """The session selected in the list (None before the first reload)."""
         selection = self.session_list.curselection()
         return self.results.sessions[selection[0]] if selection and hasattr(self, "results") else None
 
     def _open_recording(self, frame: int | None = None, keep_frame: bool = False) -> None:
+        """Open the selected recording's video in the player, at ``frame`` (or the start)."""
         session = self._selected_session()
         if session is None:
             return
         r = self.results
         try:
             motifs = r.frame_motifs(session)
-        except ExportError as e:
+        except ExportError as e:  # labels that don't fit the pose file
             motifs = None
             self.recording_note.configure(text=str(e))
         if frame is None:
@@ -445,10 +524,12 @@ class Explorer(tk.Toplevel):
         video = r.videos[session]
         self.recording_note.configure(
             text=f"{video}\n" + ("" if motifs is not None else "No motifs yet: run 'segment'."))
+        # describe: for every frame shown, the player asks _describe_frame what to write under it.
         self.recording_player.open(video, frame, describe=lambda f: self._describe_frame(session, f))
         self._update_find()
 
     def _describe_frame(self, session: str, frame: int) -> str:
+        """The text under the recording: the frame's motif and community."""
         motifs = self.results.frame_motifs(session) if self.results.window_labels(session) is not None else None
         if motifs is None:
             return ""
@@ -462,10 +543,11 @@ class Explorer(tk.Toplevel):
         return text
 
     def _fill_find_values(self) -> None:
+        """Fill the second Find list with the motifs (or communities) to choose from."""
         if self.find_kind.get() == "community" and self.results.bag:
             values = [self._community_name(i) for i in range(len(self.results.bag))]
         elif self.find_kind.get() == "community":
-            values = []
+            values = []  # no communities yet
         else:
             values = [f"motif {m}" for m in range(self.cfg.n_clusters)]
         self.find_box.configure(values=values)
@@ -479,26 +561,30 @@ class Explorer(tk.Toplevel):
         if session is None or not text or self.results.window_labels(session) is None:
             return None
         motifs = self.results.frame_motifs(session)
-        index = int(text.split()[1])
+        index = int(text.split()[1])  # "motif 3" / "community 3 'name'" -> 3
         if self.find_kind.get() == "motif":
             return motifs == index
-        return np.isin(motifs, self.results.bag[index])
+        return np.isin(motifs, self.results.bag[index])  # True where the motif is one of the community's
 
     def _update_find(self) -> None:
+        """Show how many bouts the chosen motif/community has, and its share of the recording."""
         mask = self._find_mask()
         if mask is None:
             self.find_label.configure(text="")
             return
         n = len(bouts(mask))
+        # mask.mean(): share of True values; {:.1%} writes 0.248 as "24.8%".
         self.find_label.configure(text=f"{n} bouts, {mask.mean():.1%} of the recording")
 
     def _jump(self, direction: int) -> None:
+        """Previous (-1) / next (+1) bout: go to the start of the nearest bout before/after the current frame."""
         mask = self._find_mask()
         if mask is None or not mask.any():
             return
-        starts = bouts(mask)[:, 0]
+        starts = bouts(mask)[:, 0]  # first column: where each bout starts
         current = self.recording_player.frame
         later, earlier = starts[starts > current], starts[starts < current]
+        # Past the last bout, wrap around to the first (and the other way round).
         target = (later[0] if len(later) else starts[0]) if direction > 0 else (earlier[-1] if len(earlier) else starts[-1])
         self.recording_player.pause()
         self.recording_player.seek(int(target))
@@ -516,6 +602,7 @@ class Explorer(tk.Toplevel):
     # Motifs & communities: the tree, its cut, the UMAP
     # ==================================================================
     def _build_map(self) -> None:
+        """Tab 2: controls (top), the figure with the tree and the map, its toolbar, and an info line."""
         tab = ttk.Frame(self.notebook, padding=8)
         self.notebook.add(tab, text="Motifs & communities")
         tab.columnconfigure(0, weight=1)
@@ -525,6 +612,7 @@ class Explorer(tk.Toplevel):
         controls.grid(row=0, column=0, sticky="ew")
         ttk.Label(controls, text="Cut the tree at").pack(side="left")
         self.cut = tk.StringVar(value=str(self.cfg.community_cut_tree))
+        # A Spinbox: a number box with up/down arrows. Changing it redraws the preview.
         self.cut_box = ttk.Spinbox(controls, from_=0, to=30, textvariable=self.cut, width=4,
                                    command=self._refresh_map)
         self.cut_box.pack(side="left", padx=4)
@@ -539,11 +627,13 @@ class Explorer(tk.Toplevel):
         self.umap_button = ttk.Button(controls, text="Make the motif map (run 'umap')", command=lambda: self._run("umap"))
         self.umap_button.pack(side="right")
 
+        # A matplotlib figure with two plots side by side, shown inside the Tk window.
         self.figure = Figure(figsize=(11, 6), layout="constrained")
         self.tree_ax, self.map_ax = self.figure.subplots(1, 2, width_ratios=[1, 1.2])
         self.canvas = FigureCanvasTkAgg(self.figure, master=tab)
         self.canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew", pady=(6, 0))
-        self.canvas.mpl_connect("button_press_event", self._map_click)
+        self.canvas.mpl_connect("button_press_event", self._map_click)  # mouse clicks on the figure
+        # matplotlib's toolbar: zoom, pan, back to the full view, save as image.
         toolbar_frame = ttk.Frame(tab)
         toolbar_frame.grid(row=2, column=0, sticky="ew")
         self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame, pack_toolbar=False)
@@ -558,21 +648,24 @@ class Explorer(tk.Toplevel):
         self.play_point_button = ttk.Button(bottom, text="Play this moment", state="disabled",
                                             command=lambda: self.play_moment(*self.picked))
         self.play_point_button.pack(side="right")
-        self.picked: tuple[str, int] | None = None
+        self.picked: tuple[str, int] | None = None  # (session, frame) of the clicked map point
 
     def _cut_value(self) -> int:
+        """The cut typed in the box (the saved one if the box does not hold a number)."""
         try:
             return max(int(self.cut.get()), 0)
         except ValueError:
             return self.cfg.community_cut_tree
 
     def _preview_bag(self) -> list[list[int]] | None:
+        """The communities the cut in the box would make (not yet applied)."""
         r = self.results
         if r.tree is None:
             return None
         return communities.cut_tree(r.tree, min(self._cut_value(), communities.max_cut(r.tree)))
 
     def _refresh_map(self) -> None:
+        """Redraw the tree and the map for the current cut and colouring."""
         r = self.results
         if r.tree is not None:
             self.cut_box.configure(to=communities.max_cut(r.tree))
@@ -583,9 +676,10 @@ class Explorer(tk.Toplevel):
         self.umap_button.configure(text="Redo the motif map (run 'umap --force')" if r.umap is not None
                                    else "Make the motif map (run 'umap')",
                                    command=lambda: self._run("umap", ["--force"] if r.umap is not None else []))
-        self.canvas.draw_idle()
+        self.canvas.draw_idle()  # ask matplotlib to repaint when Tk is free
 
     def _draw_tree(self, bag, names: dict[int, str]) -> None:
+        """Left plot: the motif tree, motifs coloured by community at this cut, and the cut line."""
         ax, r = self.tree_ax, self.results
         ax.clear()
         ax.set_axis_off()
@@ -594,12 +688,14 @@ class Explorer(tk.Toplevel):
                     ha="center", va="center", transform=ax.transAxes)
             return
         cut = min(self._cut_value(), communities.max_cut(r.tree))
-        pos = communities.tree_layout(r.tree)
+        pos = communities.tree_layout(r.tree)  # node -> (x, y)
+        # Each link drawn as an elbow: across at the parent's height, then down to the child.
         for a, b in r.tree.edges:
             (xa, ya), (xb, yb) = pos[a], pos[b]
             ax.plot([xa, xb, xb], [ya, ya, yb], color="0.6", lw=1, zorder=1)  # elbow: across, then down
         community_of = communities.motif_to_community(bag)
         usage = r.usage()
+        # One circle per motif: colour = community, size = share of time in that motif.
         for node, (x, y) in pos.items():
             if communities.is_motif(node):
                 motif = int(node)
@@ -607,12 +703,15 @@ class Explorer(tk.Toplevel):
                 ax.scatter([x], [y], s=60 + 1500 * (usage[motif] if motif < len(usage) else 0),
                            color=colour(c), edgecolor="black", lw=0.5, zorder=2)
                 ax.annotate(str(motif), (x, y), xytext=(0, -14), textcoords="offset points", ha="center", fontsize=8)
+        # Nodes at depth "cut" are at y = -cut; the line goes half a level above them,
+        # crossing the links that the cut separates.
         ax.axhline(0.5 - cut, color="#c62828", ls="--", lw=1.2)
         ax.text(0.01, 0.5 - cut, f" cut = {cut}", color="#c62828", va="bottom", fontsize=9,
                 transform=ax.get_yaxis_transform())
         ax.set_ylim(-communities.max_cut(r.tree) - 0.8, 0.8)
         saved = f"applied: cut {self.cfg.community_cut_tree}, {len(r.bag)} communities" if r.bag else "not applied yet"
         ax.set_title(f"Motif tree: cut {cut} makes {len(bag)} communities ({saved})", fontsize=10)
+        # Legend below the tree: each community's colour, motifs and name.
         handles = [Line2D([0], [0], marker="o", ls="", color=colour(i),
                           label=f"{i}: {' '.join(map(str, motifs))}" + (f" ({names[i]})" if i in names else ""))
                    for i, motifs in enumerate(bag)]
@@ -620,6 +719,7 @@ class Explorer(tk.Toplevel):
                   bbox_to_anchor=(0.5, 0), ncol=min(len(bag), 3), frameon=False)
 
     def _draw_umap(self, bag, names: dict[int, str]) -> None:
+        """Right plot: the UMAP, one dot per time window, coloured by motif, community or recording."""
         ax, r = self.map_ax, self.results
         ax.clear()
         if r.umap is None:
@@ -630,6 +730,7 @@ class Explorer(tk.Toplevel):
         ax.set_axis_on()
         xy, motifs = r.umap["embedding"], r.point_motif
         by = self.colour_by.get()
+        # values: one number per dot, deciding its colour; label: legend text for a value.
         if by == "community" and bag:
             community_of = communities.motif_to_community(bag)
             values = np.array([community_of.get(int(m), NO_MOTIF) for m in motifs])
@@ -640,30 +741,36 @@ class Explorer(tk.Toplevel):
         else:
             values = motifs
             label = lambda v: f"motif {v}"
+        # A colour table indexed by value; the extra grey at the end is used by
+        # NO_MOTIF (-1), because index -1 means "the last item" in Python.
         colours = np.array([colour(v) if v != NO_MOTIF else (0.8, 0.8, 0.8, 1) for v in range(values.max() + 1)]
                            + [(0.8, 0.8, 0.8, 1)])
+        # rasterized: drawn as an image, which is much faster with 30 000 dots.
         ax.scatter(xy[:, 0], xy[:, 1], s=1, c=colours[values], alpha=0.6, linewidths=0, rasterized=True)
         shown = sorted(v for v in np.unique(values) if v != NO_MOTIF)
-        if len(shown) <= 20:
+        if len(shown) <= 20:  # more would not fit
             ax.legend(handles=[Line2D([0], [0], marker="o", ls="", color=colour(v), label=label(v)) for v in shown],
                       fontsize=7, loc="upper right", markerscale=0.8, framealpha=0.7)
-        if self.picked:
+        if self.picked:  # circle the clicked point
             index = self._picked_index
             ax.scatter([xy[index, 0]], [xy[index, 1]], s=120, facecolor="none", edgecolor="black", lw=1.5)
         ax.set_title(f"UMAP of the latent space ({len(xy)} time windows), by {by}", fontsize=10)
-        ax.set_xticks([])
+        ax.set_xticks([])  # UMAP's axes have no meaning: no numbers on them
         ax.set_yticks([])
         ax.set_aspect("equal", "datalim")
 
     def _map_click(self, event) -> None:
+        """A click on the figure: on the tree, set the cut; on the map, pick the nearest point."""
         if self.toolbar.mode or event.xdata is None:  # zooming or panning, or outside the axes
             return
         r = self.results
         if event.inaxes is self.tree_ax and r.tree is not None:
+            # The click's height -> the nearest cut level (inverse of the cut line's y = 0.5 - cut).
             self.cut.set(str(int(np.clip(round(0.5 - event.ydata), 0, communities.max_cut(r.tree)))))
             self._refresh_map()
         elif event.inaxes is self.map_ax and r.umap is not None:
             xy = r.umap["embedding"]
+            # The point closest to the click (smallest squared distance).
             index = int(np.argmin((xy[:, 0] - event.xdata) ** 2 + (xy[:, 1] - event.ydata) ** 2))
             session = str(r.umap["sessions"][r.umap["session"][index]])
             frame = int(r.umap["window"][index]) + self.cfg.time_window // 2  # a window is shown on its centre
@@ -678,6 +785,7 @@ class Explorer(tk.Toplevel):
             self._refresh_map()
 
     def _apply_cut(self) -> None:
+        """'Apply this cut': save the cut in the experiment and run 'communities' (after asking)."""
         cut = self._cut_value()
         r = self.results
         if r.tree is not None and cut > communities.max_cut(r.tree):
@@ -687,6 +795,7 @@ class Explorer(tk.Toplevel):
                 f"This sets 'Community cut tree' to {cut}, saves the experiment and runs 'communities'. "
                 "Existing motif clips are moved into the new community folders.", parent=self):
             return
+        # Setting the main window's field marks the form as changed; run_command saves it first.
         self.app.vars["community_cut_tree"].set(str(cut))
         self._run("communities")
 
@@ -694,6 +803,7 @@ class Explorer(tk.Toplevel):
     # Communities & clips: watch, name, save
     # ==================================================================
     def _build_clips(self) -> None:
+        """Tab 3: recording choice (top), community/motif table and naming (left), clip player (right)."""
         tab = ttk.Frame(self.notebook, padding=8)
         self.notebook.add(tab, text="Communities & clips")
         tab.columnconfigure(1, weight=1)
@@ -711,6 +821,8 @@ class Explorer(tk.Toplevel):
         left = ttk.Frame(tab)
         left.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
         left.rowconfigure(0, weight=1)
+        # A Treeview is a table whose rows can have child rows: communities, each
+        # with its motifs below it. "#0" is the first column (the row's own text).
         self.community_tree = ttk.Treeview(left, columns=("name", "usage", "clip"), height=18, selectmode="browse")
         for column, text, width in [("#0", "Community / motif", 150), ("name", "Name", 170),
                                     ("usage", "Time", 60), ("clip", "Clip", 50)]:
@@ -723,7 +835,7 @@ class Explorer(tk.Toplevel):
         self.name_var = tk.StringVar()
         self.name_entry = ttk.Entry(left, textvariable=self.name_var, width=30)
         self.name_entry.grid(row=2, column=0, columnspan=2, sticky="ew")
-        self.name_entry.bind("<Return>", lambda _: self._set_name())
+        self.name_entry.bind("<Return>", lambda _: self._set_name())  # Enter = Set
         ttk.Button(left, text="Set", width=5, command=self._set_name).grid(row=2, column=2, padx=(4, 0))
         ttk.Button(left, text="Save names (…_labeled.csv)", command=self._save_names).grid(
             row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
@@ -736,16 +848,19 @@ class Explorer(tk.Toplevel):
         self.clip_player.grid(row=1, column=1, sticky="nsew")
 
     def _refresh_clips(self) -> None:
+        """Fill the community/motif table for the chosen recording."""
         r = self.results
         self.clip_session_box.configure(values=r.sessions)
         if self.clip_session.get() not in r.sessions:
             self.clip_session.set(r.sessions[0] if r.sessions else "")
         tree = self.community_tree
         selected = tree.selection()
-        tree.delete(*tree.get_children())
+        tree.delete(*tree.get_children())  # remove all rows
         clips = r.clips(self.clip_session.get()) if self.clip_session.get() else {}
         usage = r.usage()
+        # Row ids: "c3" for community 3, "m12" for motif 12 (read back by _selected_item).
         if not r.bag:
+            # No communities yet: a flat list of motifs.
             self.names_note.configure(text="No communities yet: choose and apply a cut in 'Motifs & communities'.")
             for motif in range(self.cfg.n_clusters):
                 tree.insert("", "end", iid=f"m{motif}", text=f"Motif {motif}",
@@ -765,16 +880,18 @@ class Explorer(tk.Toplevel):
             tree.selection_set(selected[0])
 
     def _selected_item(self) -> tuple[str, int] | None:
+        """The selected row as ("c", community) or ("m", motif); None if nothing is selected."""
         selection = self.community_tree.selection()
         return (selection[0][0], int(selection[0][1:])) if selection else None
 
     def _select_clip(self) -> None:
+        """A row was selected: play its motif's clip (for a community, its first motif with a clip)."""
         item = self._selected_item()
         if item is None:
             return
         kind, index = item
         if kind == "c":
-            self.name_var.set(self.names.get(index, ""))
+            self.name_var.set(self.names.get(index, ""))  # show its name, ready to edit
             motifs = self.results.bag[index]
         else:
             motifs = [index]
@@ -787,9 +904,10 @@ class Explorer(tk.Toplevel):
             return
         clip = clips[available[0]]
         self.clip_player.open(clip, describe=lambda _: f"{clip.parent.name} / {clip.name}")
-        self.clip_player.toggle()
+        self.clip_player.toggle()  # start playing
 
     def _set_name(self) -> None:
+        """'Set': give the typed name to the selected community (kept in memory until 'Save names')."""
         item = self._selected_item()
         if item is None or item[0] != "c":
             messagebox.showinfo("Names", "Select a community first.", parent=self)
@@ -798,6 +916,7 @@ class Explorer(tk.Toplevel):
         self.community_tree.set(f"c{item[1]}", "name", self.names[item[1]])
 
     def _save_names(self) -> None:
+        """'Save names': write community_labels.csv and the *_motifs_labeled.csv files (communities.write_labels)."""
         r = self.results
         if not r.bag:
             messagebox.showinfo("Names", "There are no communities yet: apply a cut first.", parent=self)
@@ -810,10 +929,12 @@ class Explorer(tk.Toplevel):
         self.app._write_log(f"Saved community names: {', '.join(p.name for p in written)} in {written[0].parent}\n",
                             "info")
         self.names_note.configure(text=f"Saved {len(written)} file(s) in {written[0].parent}")
+        # The other tabs show the names too: refresh them.
         self._refresh_recordings()
         self._refresh_map()
 
     def _find_selected(self) -> None:
+        """'Find in the recording': open the Recordings tab at the first bout of the selected row."""
         item = self._selected_item()
         if item is None:
             return
@@ -830,6 +951,7 @@ class Explorer(tk.Toplevel):
     # GIF: vame.gif
     # ==================================================================
     def _build_gif(self) -> None:
+        """Tab 4: the GIF options and the list of GIFs made (left), a player (right)."""
         tab = ttk.Frame(self.notebook, padding=8)
         self.notebook.add(tab, text="GIF")
         tab.columnconfigure(1, weight=1)
@@ -840,11 +962,13 @@ class Explorer(tk.Toplevel):
         ttk.Label(form, wraplength=330, justify="left", text=(
             "vame.gif: the animal, aligned and cropped, next to the UMAP of its latent space with its "
             "recent path drawn on it. Needs the input videos.")).grid(row=0, column=0, columnspan=2, sticky="w")
+        # The form's values, one StringVar each, by option name.
         self.gif_vars = {key: tk.StringVar(value=value) for key, value in
                          [("session", ""), ("start", ""), ("length", "500"), ("label", "community")]}
         ttk.Label(form, text="Recording").grid(row=1, column=0, sticky="w", pady=(10, 2))
         self.gif_session_box = ttk.Combobox(form, textvariable=self.gif_vars["session"], state="readonly", width=34)
         self.gif_session_box.grid(row=2, column=0, columnspan=2, sticky="ew")
+        # Two lines each (label, then box + hint): rows 3-4 and 5-6.
         for row, (label, key, hint) in enumerate([
             ("First time window", "start", "empty = a random, well-tracked moment"),
             ("Length (frames)", "length", "500 frames = 17 s at 30 fps"),
@@ -871,6 +995,7 @@ class Explorer(tk.Toplevel):
         self.gif_player.grid(row=0, column=1, sticky="nsew")
 
     def _refresh_gifs(self) -> None:
+        """Fill the recording choice and the list of GIFs made."""
         r = self.results
         self.gif_session_box.configure(values=r.sessions)
         if self.gif_vars["session"].get() not in r.sessions:
@@ -881,11 +1006,12 @@ class Explorer(tk.Toplevel):
             self.gif_list.insert("end", gif.name)
 
     def _make_gif(self) -> None:
+        """'Make the GIF': turn the form into 'gif' command-line options and run it."""
         extra = ["--session", self.gif_vars["session"].get(), "--algorithm", self.algorithm.get(),
                  "--label", self.gif_vars["label"].get()]
         for key in ("start", "length"):
             text = self.gif_vars[key].get().strip()
-            if text:
+            if text:  # empty start: let the command choose
                 if not text.isdigit():
                     messagebox.showerror("GIF", f"'{text}' is not a whole number.", parent=self)
                     return
@@ -895,6 +1021,7 @@ class Explorer(tk.Toplevel):
         self._run("gif", extra)
 
     def _play_gif(self) -> None:
+        """A GIF was selected in the list: play it."""
         selection = self.gif_list.curselection()
         if selection:
             gif = self.gifs[selection[0]]
