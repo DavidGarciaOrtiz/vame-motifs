@@ -107,6 +107,118 @@ Exit codes: `0` success, `1` a problem with the input or a missing step (printed
 `Error:` line, no traceback), `2` wrong command-line arguments. This makes the
 command safe to use in scripts and Slurm jobs.
 
+### With the window (GUI)
+
+Everything above can also be done from a window, without the terminal or editing YAML by hand.
+It is installed with the package; start it with:
+
+```bash
+conda activate vame
+vame-motifs-gui                    # empty form
+vame-motifs-gui experiment.yaml    # or open an existing experiment file
+```
+
+(`python -m vame_motifs.gui` works too.) The window uses Tkinter, which comes with
+conda's Python; with a Homebrew Python on macOS you may need `brew install python-tk`.
+
+The window has three parts: the experiment form (left), the commands (right) and their
+output (bottom). The bar at the top shows which experiment file is open, with *New*,
+*Open…*, *Save* and *Save as…*. A `*` in the title means there are unsaved changes.
+
+**Step by step**
+
+1. **Choose where the experiment file lives.** Click *Save as…* and save
+   `experiment.yaml` next to your data (or *Open…* an existing one). Do this first:
+   the paths you pick are stored relative to this file.
+2. **Data tab.** With *File…* or *Folder…*, choose the pose files (a folder of
+   DeepLabCut `.csv` files, or one file) and, optionally, the raw videos (only needed
+   for the `videos` step). Set the frame rate and the output folder.
+3. **Body parts tab.** Click *Read body parts from pose files*: the names are read from
+   the first CSV's header. Pick *Align center* and *Align direction* from the lists, and
+   select in *Exclude* any body parts to leave out (click to select or unselect).
+4. **Motifs tab.** Set the number of motifs, the method (`hmm`, `kmeans` or `both`) and
+   the minimum DLC confidence.
+5. **Advanced tab.** Optional; the defaults are the same as in the YAML above. Leave
+   them as they are unless you know you need to change them.
+6. **Check the data.** Click `validate`. The output panel lists the body parts and warns
+   about poorly tracked ones. Fix any `Error:` line (shown in red) before going on.
+7. **Run.** Click *Run all*. It runs every step in order and skips steps already done.
+   Training is slow: the window stays usable, and the status line at the bottom says
+   which command is running. *Stop* ends it.
+8. **Look at the results.** When the output panel shows `[Finished]`, click
+   *Open output folder* (see [4. Outputs](#4-outputs)). *Status* shows which steps are done.
+
+The form is saved automatically before each command, so what runs is always what you see.
+
+**Buttons and options**
+
+| Control | What it does |
+|---|---|
+| *Run all* | `vame-motifs run`: all steps, skipping those already done |
+| `validate` … `videos` | One step at a time, the same commands as in the table above |
+| *Status* | Which steps are done |
+| *Force (redo steps)* | Adds `--force` to *Run all* and `segment`: redo the steps instead of skipping them |
+| *Verbose* | Adds `-v`: more detailed output |
+| *Stop* | Ends the running command (asks first) |
+| *Open output folder* | Opens the output folder in Finder / Explorer |
+| *Clear* | Empties the output panel |
+| *On GPU server* | Runs the commands on the server set in the *GPU server* tab (see below) |
+
+**Changing settings later** works as in the terminal: a new number of motifs or method,
+just *Run all* again; a change in the *Advanced* tab, alignment, exclusions or minimum
+confidence, tick *Force* and *Run all* (the model is retrained).
+
+The window only runs `vame-motifs <command> -c experiment.yaml` for you, so results, run
+records and exit codes are identical to the terminal, and an `experiment.yaml` saved
+from the window can be used directly with the CLI (for example on the cluster).
+It needs a desktop: on a Slurm cluster, use the commands below, or run the window on your
+computer and train on the server, as follows.
+
+**Training on a GPU server (SSH)**
+
+Training is slow without a GPU. The window can run the commands on a server you can reach
+with SSH, while you keep working on your computer:
+
+1. Install vame-motifs on the server too (section 1), and note the path of that
+   environment's Python, e.g. `~/miniconda3/envs/vame/bin/python`.
+2. In the **GPU server** tab, fill in:
+
+   | Field | Example | |
+   |---|---|---|
+   | Server | `me@gpu.example.org` | or a `Host` name from `~/.ssh/config` |
+   | Port | | empty = 22 |
+   | Key file | `~/.ssh/id_ed25519` | empty = your default SSH key |
+   | Jump host | `me@login.example.org` | optional: a login node to go through (`ssh -J`) |
+   | Folder on server | `vame-motifs/exp1` | where the experiment goes; relative = in your home folder |
+   | Python on server | `~/miniconda3/envs/vame/bin/python` | the Python with vame-motifs installed |
+   | Run prefix | `srun --gres=gpu:1 -p gpu` | optional: on a Slurm cluster, to run on a GPU node |
+
+3. Click **Connect**. This opens one SSH connection (through the jump host, if set) and keeps
+   it open as a tunnel that every later step goes through, so a password or two-factor code
+   is asked only once, in a small window. With an SSH key and no password, connecting first
+   is optional.
+4. Tick **On GPU server** in the *Run* box and use the buttons as usual.
+
+Each command then runs in three steps, all shown in the output panel:
+
+- **upload**: the experiment file, and, with *Copy pose files and videos…* ticked, the pose
+  files and videos from your computer (only what changed, with `rsync`);
+- **run**: `vame-motifs <command> -c experiment.yaml` on the server, with its output streamed
+  live; *Stop* ends it on the server too;
+- **download**: the output folder, back to where your experiment file points, so *Open output
+  folder* shows the results (even after a failed command, for its run record).
+
+The pose files, videos and output folder can be anywhere on your computer. Those inside the
+experiment folder keep the same place in the server folder; those elsewhere are copied to
+`inputs/` in the server folder (and results come back from its `outputs/`), and the
+experiment file sent to the server points there. Your local experiment file is not changed.
+A path that does not exist on your computer (e.g. `/pool01/...`) is taken to be a path on the
+server and is not copied: point it at data already on the server to skip uploading it.
+The server settings are saved for your user in `~/.config/vame-motifs/gui.json`, not in the
+experiment file, and each experiment remembers its own folder on the server. This needs the
+`ssh` and `rsync` programs (included in macOS and Linux); *Connect* is not available on Windows,
+where an SSH key is needed instead.
+
 ### On a Slurm cluster (e.g. Pedraforca)
 
 Everything runs on the server; no GUI step is involved. Submit the slow command as a job:
@@ -175,6 +287,9 @@ that produced it.
 ```
 src/vame_motifs/
 ├── cli.py          commands: parse arguments, call functions, print, exit codes
+├── gui.py          window: edits the experiment YAML, runs the cli.py commands
+├── remote.py       the ssh/rsync command lines that run them on a GPU server
+├── askpass.py      the password window ssh uses when the window connects
 ├── config.py       load_config()   experiment YAML -> ExperimentConfig
 ├── io.py           read_dlc_csv()  DLC CSV -> PoseFile
 ├── validation.py   validate()      checks before any VAME step (uses config.py + io.py)

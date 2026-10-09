@@ -23,6 +23,9 @@ dev = ["pytest", "ruff"]
 [project.scripts]
 vame-motifs = "vame_motifs.cli:main"
 
+[project.gui-scripts]
+vame-motifs-gui = "vame_motifs.gui:main"
+
 [tool.setuptools.dynamic]
 version = { attr = "vame_motifs.__version__" }
 

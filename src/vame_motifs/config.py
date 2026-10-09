@@ -34,7 +34,7 @@ class ExperimentConfig:
     align_direction: str
     n_clusters: int
     method: str = "hmm"
-    min_confidence: float = 0.9
+    min_confidence: float = 0.75
     exclude: list[str] = field(default_factory=list)
     videos: list[Path] = field(default_factory=list)
     output: Path = Path("outputs")
@@ -87,6 +87,7 @@ def _find_videos(video_path: Path, pose_files: list[Path]) -> list[Path]:
     Two DeepLabCut naming patterns are supported:
     - raw video: the video name is a prefix of the pose CSV's stem
       (``session1.mp4`` -> ``session1DLC_resnet50_....csv``).
+      
     - labeled video: the pose CSV's stem is a prefix of the video name,
       with DLC's own suffix appended
       (``session1DLC_resnet50_..._filtered.csv`` ->
