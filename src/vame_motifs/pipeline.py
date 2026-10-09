@@ -111,7 +111,10 @@ class VamePipeline:
         init_new_project returns an existing project untouched, ignoring
         config_kwargs, so the settings are written again with update_config.
         That makes YAML edits (e.g. a new n_clusters) take effect on re-runs.
+        For the same reason, an existing project never gets new recordings:
+        _check_project_sessions stops early if the recordings changed.
         """
+        self._check_project_sessions()
         vame = _import_vame()
         from vame.util.auxiliary import read_config, update_config
 
@@ -128,6 +131,35 @@ class VamePipeline:
         # Keyword arguments only: VAME's state-saving decorator misreads positional ones.
         self._config = update_config(config=read_config(config_path), config_update=settings)
         return self._config
+
+    def _check_project_sessions(self) -> None:
+        """Raise if an existing VAME project was made for other recordings than the YAML's pose files.
+
+        VAME keeps the recordings it was created with: added pose files would be
+        left out of training, and segmentation (which only checks the first
+        recording's results) would silently skip them.
+        """
+        config_path = self.project_path / "config.yaml"
+        if not config_path.exists():
+            return  # a new project: VAME creates it with these pose files
+        import yaml
+
+        with open(config_path) as fh:
+            in_project = set((yaml.safe_load(fh) or {}).get("session_names") or [])
+        in_yaml = {p.stem for p in self.cfg.pose_files}
+        if in_project == in_yaml:
+            return
+        changes = []
+        if in_yaml - in_project:
+            changes.append(f"new: {', '.join(sorted(in_yaml - in_project))}")
+        if in_project - in_yaml:
+            changes.append(f"no longer in the pose files: {', '.join(sorted(in_project - in_yaml))}")
+        raise PipelineError(
+            f"The VAME project in {self.project_path} was made for {len(in_project)} recording(s), but the "
+            f"experiment now has {len(in_yaml)} ({'; '.join(changes)}). VAME cannot add or remove recordings "
+            f"in an existing project: set a new output folder (or move {self.project_path.name} away) and run "
+            "everything again."
+        )
 
     @property
     def config(self) -> dict:

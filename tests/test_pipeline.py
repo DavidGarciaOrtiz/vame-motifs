@@ -127,3 +127,35 @@ def test_gif_start_is_in_a_well_tracked_stretch(experiment):
     start = pipeline._well_tracked_start(confidence, num_points=900, length=100)
 
     assert 595 <= start <= 800  # at least 95% of its frames well tracked
+
+
+def _write_project_config(pipeline: VamePipeline, sessions: list[str]) -> None:
+    config_path = pipeline.project_path / "config.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("session_names:\n" + "".join(f"- {s}\n" for s in sessions))
+
+
+def test_project_with_other_recordings_is_refused_before_vame_runs(experiment):
+    cfg = load_config(experiment)  # rat01DLC_resnet50 and rat02DLC_resnet50
+    pipeline = VamePipeline(cfg)
+    _write_project_config(pipeline, ["rat01DLC_resnet50"])
+
+    with pytest.raises(PipelineError, match=r"made for 1 recording\(s\), but the experiment now has 2 "
+                                            r"\(new: rat02DLC_resnet50\).*new output folder"):
+        pipeline.init()
+
+
+def test_removed_recording_is_named(experiment):
+    pipeline = VamePipeline(load_config(experiment))
+    _write_project_config(pipeline, ["rat01DLC_resnet50", "rat02DLC_resnet50", "rat03DLC_resnet50"])
+
+    with pytest.raises(PipelineError, match="no longer in the pose files: rat03DLC_resnet50"):
+        pipeline._check_project_sessions()
+
+
+def test_same_recordings_or_no_project_pass(experiment):
+    pipeline = VamePipeline(load_config(experiment))
+    pipeline._check_project_sessions()  # no project yet
+
+    _write_project_config(pipeline, ["rat02DLC_resnet50", "rat01DLC_resnet50"])  # order does not matter
+    pipeline._check_project_sessions()
