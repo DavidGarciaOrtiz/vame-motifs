@@ -21,14 +21,17 @@ with VAME.
 
 from __future__ import annotations
 
+import re
 import tkinter as tk
+from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
+import pandas as pd
 from matplotlib import colormaps
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
@@ -47,6 +50,7 @@ if TYPE_CHECKING:
 # tab20's strong colours first, then the light ones: neighbouring numbers look different
 PALETTE = [colormaps["tab20"](i) for i in [*range(0, 20, 2), *range(1, 20, 2)]]
 NO_MOTIF = -1
+NAMES_FILE = "recording_names.csv"  # in the output folder: the names given with 'Rename…'
 
 
 def colour(i: int):
@@ -57,6 +61,18 @@ def bouts(mask: np.ndarray) -> np.ndarray:
     """(first, last) frame of each run of True values, in order."""
     edges = np.diff(np.concatenate([[0], np.asarray(mask, dtype=int), [0]]))
     return np.column_stack([np.flatnonzero(edges == 1), np.flatnonzero(edges == -1) - 1])
+
+
+def short_names(sessions: list[str]) -> dict[str, str]:
+    """A short name per recording: the last digits of its video's name, i.e. of the pose file's
+    name before DeepLabCut's "DLC..." ('01022023_001_16236-62755DLC_Resnet50_...' -> '62755').
+    A recording without digits there, or sharing them with another, keeps its full name."""
+    digits = {}
+    for session in sessions:
+        found = re.findall(r"\d+", session.split("DLC", 1)[0])
+        digits[session] = found[-1] if found else None
+    counts = Counter(digits.values())
+    return {session: d if d and counts[d] == 1 else session for session, d in digits.items()}
 
 
 # ======================================================================
@@ -72,10 +88,37 @@ class Results:
         self.pose_files = dict(zip(self.sessions, cfg.pose_files))
         self.videos: dict[str, Path] = dict(zip(self.sessions, cfg.videos))
         self._frame_motifs: dict[str, np.ndarray] = {}
+        self.display = self._load_display_names()  # session -> the name shown in the window
         self.tree = self._load_tree()
         self.bag = self._load_bag()
         self.umap = dict(np.load(self.pipeline.umap_path)) if self.pipeline.umap_path.exists() else None
         self.point_motif = self._point_motifs()
+
+    # --- recording names ------------------------------------------------
+    @property
+    def names_path(self) -> Path:
+        return self.cfg.output / NAMES_FILE
+
+    def _load_display_names(self) -> dict[str, str]:
+        names = short_names(self.sessions)
+        if self.names_path.exists():
+            saved = pd.read_csv(self.names_path, dtype=str, keep_default_na=False)
+            names.update({s: n for s, n in zip(saved["recording"], saved["name"]) if s in names and n.strip()})
+        return names
+
+    def rename(self, session: str, name: str) -> None:
+        """Give a recording a new name in the window (empty: back to its short name) and save it.
+
+        Only names that differ from the short name are saved, one row per recording.
+        """
+        default = short_names(self.sessions)[session]
+        name = name.strip() or default
+        if name in {n for s, n in self.display.items() if s != session}:
+            raise ValueError(f"'{name}' is already the name of another recording")
+        self.display[session] = name
+        custom = {s: n for s, n in self.display.items() if n != short_names(self.sessions)[s]}
+        self.names_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"recording": list(custom), "name": list(custom.values())}).to_csv(self.names_path, index=False)
 
     # --- motifs ---------------------------------------------------------
     def window_labels(self, session: str) -> np.ndarray | None:
@@ -93,11 +136,11 @@ class Results:
             self._frame_motifs[session] = per_frame.fillna(NO_MOTIF).to_numpy(dtype=int)
         return self._frame_motifs[session]
 
-    def usage(self) -> np.ndarray:
-        """Share of all labelled time windows in each motif, over all recordings."""
+    def usage(self, session: str | None = None) -> np.ndarray:
+        """Share of the labelled time windows in each motif, in one recording (or over all of them)."""
         counts = np.zeros(self.cfg.n_clusters)
-        for session in self.sessions:
-            labels = self.window_labels(session)
+        for one in [session] if session else self.sessions:
+            labels = self.window_labels(one)
             if labels is not None:
                 counts += np.bincount(labels.astype(int), minlength=self.cfg.n_clusters)[: self.cfg.n_clusters]
         return counts / counts.sum() if counts.sum() else counts
@@ -306,9 +349,19 @@ class Explorer(tk.Toplevel):
                                           width=8)
         self.algorithm_box.pack(side="left", padx=4)
         self.algorithm_box.bind("<<ComboboxSelected>>", lambda _: self.reload(read_config=False))
-        ttk.Button(bar, text="Reload", command=self.reload).pack(side="left", padx=4)
+        ttk.Label(bar, text="Recording").pack(side="left", padx=(16, 0))
+        self.recording = tk.StringVar()  # the selected recording's name, as shown
+        self.recording_box = ttk.Combobox(bar, textvariable=self.recording, state="readonly", width=18)
+        self.recording_box.pack(side="left", padx=4)
+        self.recording_box.bind("<<ComboboxSelected>>", lambda _: self._select_recording(self._session_named()))
+        ttk.Button(bar, text="Rename…", command=self._rename_recording).pack(side="left")
+        ttk.Button(bar, text="Reload", command=self.reload).pack(side="left", padx=(16, 4))
         self.summary = ttk.Label(bar, text="", foreground="gray")
         self.summary.pack(side="left", padx=8)
+        self.recording_files = ttk.Label(self, text="", foreground="gray", padding=(8, 4, 8, 0))
+        self.recording_files.pack(fill="x")
+        self.session: str | None = None  # the selected recording (its pose file's name), shown in every tab
+        self._player_session: str | None = None  # the recording open in the Recordings player
 
         self.notebook = ttk.Notebook(self, padding=8)
         self.notebook.pack(fill="both", expand=True)
@@ -356,10 +409,52 @@ class Explorer(tk.Toplevel):
         self.names = r.names()
         self.picked = None  # a point of the previous map
         self.play_point_button.configure(state="disabled")
-        self._refresh_recordings()
+        self.recording_box.configure(values=[r.display[s] for s in r.sessions])
+        if self.session not in r.sessions:
+            self.session = r.sessions[0] if r.sessions else None
+        self._select_recording(self.session)
+
+    # ==================================================================
+    # The selected recording (top bar): every tab shows this one
+    # ==================================================================
+    def _shown(self, session: str) -> str:
+        return self.results.display.get(session, session)
+
+    def _session_named(self) -> str | None:
+        return next((s for s, n in self.results.display.items() if n == self.recording.get()), None)
+
+    def _select_recording(self, session: str | None, frame: int | None = None) -> None:
+        """Show ``session`` in every tab (and the Recordings player at ``frame``, if given)."""
+        r = self.results
+        self.session = session
+        if session is None:
+            self.recording.set("")
+            self.recording_files.configure(text="No recordings.")
+        else:
+            self.recording.set(self._shown(session))
+            video = r.videos[session].name if session in r.videos else "none (set 'Videos' in the Data tab)"
+            self.recording_files.configure(text=f"{self._shown(session)}:   pose file {r.pose_files[session].name}"
+                                                f"   ·   video {video}")
+        self._refresh_recordings(frame)
         self._refresh_map()
         self._refresh_clips()
         self._refresh_gifs()
+
+    def _rename_recording(self) -> None:
+        if self.session is None:
+            return
+        name = simpledialog.askstring(
+            "Rename recording", f"Name shown for {self.session}\n(empty: back to '{short_names(self.results.sessions)[self.session]}')",
+            initialvalue=self._shown(self.session), parent=self)
+        if name is None:
+            return
+        try:
+            self.results.rename(self.session, name)
+        except (ValueError, OSError) as e:
+            messagebox.showerror("Rename recording", str(e), parent=self)
+            return
+        self.recording_box.configure(values=[self.results.display[s] for s in self.results.sessions])
+        self._select_recording(self.session)
 
     def _run(self, command: str, extra: list[str] | None = None) -> None:
         """Run a vame-motifs command through the main window, then reload."""
@@ -378,23 +473,16 @@ class Explorer(tk.Toplevel):
     def _build_recordings(self) -> None:
         tab = ttk.Frame(self.notebook, padding=8)
         self.notebook.add(tab, text="Recordings")
-        tab.columnconfigure(1, weight=1)
+        tab.columnconfigure(0, weight=1)
         tab.rowconfigure(0, weight=1)
 
-        left = ttk.Frame(tab)
-        left.grid(row=0, column=0, sticky="ns", padx=(0, 8))
-        ttk.Label(left, text="Recordings (input videos)").pack(anchor="w")
-        self.session_list = tk.Listbox(left, width=42, exportselection=False)
-        self.session_list.pack(fill="both", expand=True)
-        self.session_list.bind("<<ListboxSelect>>", lambda _: self._open_recording())
-        self.recording_note = ttk.Label(left, text="", foreground="gray", wraplength=300, justify="left")
-        self.recording_note.pack(anchor="w", pady=(4, 0))
-
         self.recording_player = VideoPlayer(tab, width=720, height=540)
-        self.recording_player.grid(row=0, column=1, sticky="nsew")
+        self.recording_player.grid(row=0, column=0, sticky="nsew")
+        self.recording_note = ttk.Label(tab, text="", foreground="gray")
+        self.recording_note.grid(row=1, column=0, sticky="w")
 
         find = ttk.Frame(tab)
-        find.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        find.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         ttk.Label(find, text="Find").pack(side="left")
         self.find_kind = tk.StringVar(value="motif")
         kind = ttk.Combobox(find, textvariable=self.find_kind, values=["motif", "community"], state="readonly", width=10)
@@ -409,54 +497,46 @@ class Explorer(tk.Toplevel):
         self.find_label = ttk.Label(find, text="", foreground="gray")
         self.find_label.pack(side="left", padx=8)
 
-    def _refresh_recordings(self) -> None:
-        r = self.results
-        selected = self._selected_session()
-        self.session_list.delete(0, "end")
-        for session in r.sessions:
-            self.session_list.insert("end", session if session in r.videos else f"{session}  (no video)")
+    def _refresh_recordings(self, frame: int | None = None) -> None:
+        """Open the selected recording in the player (staying at the same frame if it is already open)."""
         self._fill_find_values()
-        if r.sessions:
-            index = r.sessions.index(selected) if selected in r.sessions else 0
-            self.session_list.selection_set(index)
-            self._open_recording(keep_frame=selected == r.sessions[index])
+        if frame is None and self.session == self._player_session:
+            frame = self.recording_player.frame
+        self._open_recording(frame or 0)
 
     def _selected_session(self) -> str | None:
-        selection = self.session_list.curselection()
-        return self.results.sessions[selection[0]] if selection and hasattr(self, "results") else None
+        return self.session
 
-    def _open_recording(self, frame: int | None = None, keep_frame: bool = False) -> None:
-        session = self._selected_session()
+    def _open_recording(self, frame: int = 0) -> None:
+        session = self.session
+        self._player_session = session
         if session is None:
+            self.recording_player.close()
             return
         r = self.results
         try:
             motifs = r.frame_motifs(session)
+            note = "" if motifs is not None else "No motifs yet: run 'segment'."
         except ExportError as e:
-            motifs = None
-            self.recording_note.configure(text=str(e))
-        if frame is None:
-            frame = self.recording_player.frame if keep_frame else 0
+            note = str(e)
         if session not in r.videos:
             self.recording_player.close()
             self.recording_player._blank("No video for this recording: set 'Videos' in the Data tab.")
             self.recording_note.configure(text="")
             return
-        video = r.videos[session]
-        self.recording_note.configure(
-            text=f"{video}\n" + ("" if motifs is not None else "No motifs yet: run 'segment'."))
-        self.recording_player.open(video, frame, describe=lambda f: self._describe_frame(session, f))
+        self.recording_note.configure(text=f"{r.videos[session]}   {note}")
+        self.recording_player.open(r.videos[session], frame, describe=lambda f: self._describe_frame(session, f))
         self._update_find()
 
     def _describe_frame(self, session: str, frame: int) -> str:
         motifs = self.results.frame_motifs(session) if self.results.window_labels(session) is not None else None
         if motifs is None:
-            return ""
+            return self._shown(session)
         if frame >= len(motifs) or motifs[frame] == NO_MOTIF:
-            return "No motif (first and last frames: outside VAME's time windows)"
+            return f"{self._shown(session)}  ·  No motif (first and last frames: outside VAME's time windows)"
         motif = int(motifs[frame])
         community = self.results.community_of().get(motif)
-        text = f"Motif {motif}"
+        text = f"{self._shown(session)}  ·  Motif {motif}"
         if community is not None:
             text += f"  ·  {self._community_name(community).capitalize()}"
         return text
@@ -507,10 +587,8 @@ class Explorer(tk.Toplevel):
         """Show a recording at a frame (from the map or a clip)."""
         if session not in self.results.sessions:
             return
-        self.session_list.selection_clear(0, "end")
-        self.session_list.selection_set(self.results.sessions.index(session))
+        self._select_recording(session, frame)
         self.show("recordings")
-        self._open_recording(frame=frame)
 
     # ==================================================================
     # Motifs & communities: the tree, its cut, the UMAP
@@ -599,7 +677,7 @@ class Explorer(tk.Toplevel):
             (xa, ya), (xb, yb) = pos[a], pos[b]
             ax.plot([xa, xb, xb], [ya, ya, yb], color="0.6", lw=1, zorder=1)  # elbow: across, then down
         community_of = communities.motif_to_community(bag)
-        usage = r.usage()
+        usage = r.usage(self.session)  # circle size: time in the selected recording
         for node, (x, y) in pos.items():
             if communities.is_motif(node):
                 motif = int(node)
@@ -612,7 +690,8 @@ class Explorer(tk.Toplevel):
                 transform=ax.get_yaxis_transform())
         ax.set_ylim(-communities.max_cut(r.tree) - 0.8, 0.8)
         saved = f"applied: cut {self.cfg.community_cut_tree}, {len(r.bag)} communities" if r.bag else "not applied yet"
-        ax.set_title(f"Motif tree: cut {cut} makes {len(bag)} communities ({saved})", fontsize=10)
+        ax.set_title(f"Motif tree: cut {cut} makes {len(bag)} communities ({saved})\n"
+                     f"circle size: time in {self._shown(self.session) if self.session else '-'}", fontsize=10)
         handles = [Line2D([0], [0], marker="o", ls="", color=colour(i),
                           label=f"{i}: {' '.join(map(str, motifs))}" + (f" ({names[i]})" if i in names else ""))
                    for i, motifs in enumerate(bag)]
@@ -636,7 +715,7 @@ class Explorer(tk.Toplevel):
             label = lambda v: f"{v}" + (f" {names[v]}" if v in names else "")
         elif by == "recording":
             values = r.umap["session"]
-            label = lambda v: str(r.umap["sessions"][v])[:30]
+            label = lambda v: self._shown(str(r.umap["sessions"][v]))[:30]
         else:
             values = motifs
             label = lambda v: f"motif {v}"
@@ -669,7 +748,7 @@ class Explorer(tk.Toplevel):
             frame = int(r.umap["window"][index]) + self.cfg.time_window // 2  # a window is shown on its centre
             motif = int(r.point_motif[index])
             community_of = communities.motif_to_community(self._preview_bag() or [])
-            text = f"{session}, frame {frame} ({frame / self.cfg.fps:.1f} s): motif {motif}"
+            text = f"{self._shown(session)}, frame {frame} ({frame / self.cfg.fps:.1f} s): motif {motif}"
             if motif in community_of:
                 text += f", {self._community_name(community_of[motif])} at this cut"
             self.picked, self._picked_index = (session, frame), index
@@ -701,19 +780,16 @@ class Explorer(tk.Toplevel):
 
         top = ttk.Frame(tab)
         top.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
-        ttk.Label(top, text="Clips of recording").pack(side="left")
-        self.clip_session = tk.StringVar()
-        self.clip_session_box = ttk.Combobox(top, textvariable=self.clip_session, state="readonly", width=60)
-        self.clip_session_box.pack(side="left", padx=4)
-        self.clip_session_box.bind("<<ComboboxSelected>>", lambda _: self._refresh_clips())
+        self.clips_title = ttk.Label(top, text="")
+        self.clips_title.pack(side="left")
         ttk.Button(top, text="Cut the clips (run 'videos')", command=lambda: self._run("videos")).pack(side="right")
 
         left = ttk.Frame(tab)
         left.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
         left.rowconfigure(0, weight=1)
         self.community_tree = ttk.Treeview(left, columns=("name", "usage", "clip"), height=18, selectmode="browse")
-        for column, text, width in [("#0", "Community / motif", 150), ("name", "Name", 170),
-                                    ("usage", "Time", 60), ("clip", "Clip", 50)]:
+        for column, text, width in [("#0", "Community / motif", 150), ("name", "Name", 150),
+                                    ("usage", "Time", 90), ("clip", "Clip", 50)]:
             self.community_tree.heading(column, text=text)
             self.community_tree.column(column, width=width, stretch=column == "name")
         self.community_tree.grid(row=0, column=0, columnspan=3, sticky="nsew")
@@ -737,14 +813,14 @@ class Explorer(tk.Toplevel):
 
     def _refresh_clips(self) -> None:
         r = self.results
-        self.clip_session_box.configure(values=r.sessions)
-        if self.clip_session.get() not in r.sessions:
-            self.clip_session.set(r.sessions[0] if r.sessions else "")
+        name = self._shown(self.session) if self.session else "-"
+        self.clips_title.configure(text=f"Motifs, time and clips of recording {name} (choose it at the top)")
+        self.community_tree.heading("usage", text=f"Time in {name}")
         tree = self.community_tree
         selected = tree.selection()
         tree.delete(*tree.get_children())
-        clips = r.clips(self.clip_session.get()) if self.clip_session.get() else {}
-        usage = r.usage()
+        clips = r.clips(self.session) if self.session else {}
+        usage = r.usage(self.session)
         if not r.bag:
             self.names_note.configure(text="No communities yet: choose and apply a cut in 'Motifs & communities'.")
             for motif in range(self.cfg.n_clusters):
@@ -778,7 +854,7 @@ class Explorer(tk.Toplevel):
             motifs = self.results.bag[index]
         else:
             motifs = [index]
-        clips = self.results.clips(self.clip_session.get())
+        clips = self.results.clips(self.session)
         available = [m for m in motifs if m in clips]
         if not available:
             self.clip_player.close()
@@ -786,7 +862,8 @@ class Explorer(tk.Toplevel):
                                     "'Cut the clips' makes them (VAME skips motifs that never occur).")
             return
         clip = clips[available[0]]
-        self.clip_player.open(clip, describe=lambda _: f"{clip.parent.name} / {clip.name}")
+        name = self._shown(self.session)
+        self.clip_player.open(clip, describe=lambda _: f"{name}  ·  {clip.parent.name} / motif {clip.stem.rsplit('_', 1)[-1]}")
         self.clip_player.toggle()
 
     def _set_name(self) -> None:
@@ -818,7 +895,7 @@ class Explorer(tk.Toplevel):
         if item is None:
             return
         kind, index = item
-        session = self.clip_session.get()
+        session = self.session
         self.find_kind.set("community" if kind == "c" else "motif")
         self._fill_find_values()
         self.find_value.set(self._community_name(index) if kind == "c" else f"motif {index}")
@@ -841,10 +918,9 @@ class Explorer(tk.Toplevel):
             "vame.gif: the animal, aligned and cropped, next to the UMAP of its latent space with its "
             "recent path drawn on it. Needs the input videos.")).grid(row=0, column=0, columnspan=2, sticky="w")
         self.gif_vars = {key: tk.StringVar(value=value) for key, value in
-                         [("session", ""), ("start", ""), ("length", "500"), ("label", "community")]}
-        ttk.Label(form, text="Recording").grid(row=1, column=0, sticky="w", pady=(10, 2))
-        self.gif_session_box = ttk.Combobox(form, textvariable=self.gif_vars["session"], state="readonly", width=34)
-        self.gif_session_box.grid(row=2, column=0, columnspan=2, sticky="ew")
+                         [("start", ""), ("length", "500"), ("label", "community")]}
+        self.gif_title = ttk.Label(form, text="")
+        self.gif_title.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 2))
         for row, (label, key, hint) in enumerate([
             ("First time window", "start", "empty = a random, well-tracked moment"),
             ("Length (frames)", "length", "500 frames = 17 s at 30 fps"),
@@ -872,16 +948,18 @@ class Explorer(tk.Toplevel):
 
     def _refresh_gifs(self) -> None:
         r = self.results
-        self.gif_session_box.configure(values=r.sessions)
-        if self.gif_vars["session"].get() not in r.sessions:
-            self.gif_vars["session"].set(r.sessions[0] if r.sessions else "")
-        self.gifs = r.gifs()
+        name = self._shown(self.session) if self.session else "-"
+        self.gif_title.configure(text=f"Recording {name} (choose it at the top)")
+        # This recording's GIFs, listed with its shown name instead of the long file name.
+        self.gifs = [g for g in r.gifs() if self.session and g.name.startswith(f"{self.session}_")]
         self.gif_list.delete(0, "end")
         for gif in self.gifs:
-            self.gif_list.insert("end", gif.name)
+            self.gif_list.insert("end", name + gif.name[len(self.session):])
 
     def _make_gif(self) -> None:
-        extra = ["--session", self.gif_vars["session"].get(), "--algorithm", self.algorithm.get(),
+        if self.session is None:
+            return
+        extra = ["--session", self.session, "--algorithm", self.algorithm.get(),
                  "--label", self.gif_vars["label"].get()]
         for key in ("start", "length"):
             text = self.gif_vars[key].get().strip()
@@ -898,5 +976,5 @@ class Explorer(tk.Toplevel):
         selection = self.gif_list.curselection()
         if selection:
             gif = self.gifs[selection[0]]
-            self.gif_player.open(gif, describe=lambda _: gif.name)
+            self.gif_player.open(gif, describe=lambda _: self.gif_list.get(selection[0]))
             self.gif_player.toggle()

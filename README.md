@@ -174,11 +174,18 @@ The form is saved automatically before each command, so what runs is always what
 *Explore results…* opens a second window to look at what went in and what came out,
 and to act on it. *Segmentation* (top) picks `hmm` or `kmeans` when the method is `both`.
 
+*Recording* (top) picks the recording every tab shows; the line below it names its pose
+file and video. Recordings are named by the last digits of their video's name (the part
+before `DLC`), e.g. `01022023_001_16236-62755DLC_Resnet50_...` is shown as `62755`; if two
+recordings would get the same digits, they keep their full names. *Rename…* gives the
+selected recording another name (empty: back to the digits); names are saved in
+`<output>/recording_names.csv` and only change what the window shows.
+
 | Tab | What you can do |
 |---|---|
-| *Recordings* | Play each input video, with the motif and community of the frame shown under it. *Find* a motif or community and jump from one bout of it to the next |
+| *Recordings* | Play the recording's input video, with the motif and community of the frame shown under it. *Find* a motif or community and jump from one bout of it to the next |
 | *Motifs & communities* | VAME's motif tree (motif circles sized by time spent) next to the UMAP of the latent space. Choose the integer at which to cut the tree (the box, or click the tree at that height): the communities it makes are shown at once. *Apply this cut* saves it as *Community cut tree* and runs `communities`. Click the map to see that moment of the recording |
-| *Communities & clips* | Each community and its motifs, with the share of time. Select a motif to play its clip (from `videos`). Name the communities and *Save names*: writes `community_labels.csv` and a `<recording>_motifs_labeled.csv` per recording |
+| *Communities & clips* | Each community and its motifs, with the share of the selected recording's time in each. Select a motif to play its clip (from `videos`). Name the communities and *Save names*: writes `community_labels.csv` and a `<recording>_motifs_labeled.csv` per recording |
 | *GIF* | Make a `vame.gif` for a recording (runs `gif`), and play the GIFs made |
 
 The map is computed once by `umap` (*Make the motif map*), and again after retraining.
@@ -261,6 +268,7 @@ outputs/
 │       ├── community_labels.csv     community, label, motifs   (after 'Save names')
 │       └── <recording>_motifs_labeled.csv   frame, time_s, motif, community, label
 ├── gifs/<recording>_<algorithm>_<label>_<start>-<end>.gif   (after 'gif')
+├── recording_names.csv              names given with 'Rename…' in the window
 ├── runs/<date>_<command>/           experiment.yaml copy, versions.txt, run.log
 └── vame_project/                    VAME's own project (model, logs, plots in model/evaluate/)
     └── results/
