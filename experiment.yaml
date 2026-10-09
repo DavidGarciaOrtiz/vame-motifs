@@ -17,4 +17,4 @@ advanced:
   time_window: 30
   zdims: 30
   seed: 42
-  community_cut_tree: 3
+  community_cut_tree: 1
