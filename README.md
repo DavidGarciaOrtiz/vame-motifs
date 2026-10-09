@@ -92,7 +92,10 @@ be run one by one:
 | `train`   | Trains and evaluates the VAME model | the slow part: use a GPU |
 | `segment` | Assigns a motif to every time window (`--force` recomputes) | minutes (kmeans is much faster than hmm) |
 | `export`  | Writes the motif CSVs and the usage summary | seconds |
-| `videos`  | Cuts a short `.mp4` per motif per recording, from `input.videos` (needs `input.videos`) | minutes |
+| `communities` | Groups motifs into communities by cutting VAME's motif tree at `advanced.community_cut_tree` | seconds |
+| `videos`  | Cuts a short `.mp4` per motif per recording, from `input.videos` (needs `input.videos`), in one folder per community | minutes |
+| `umap`    | 2-D map (UMAP) of the latent space, for the window's *Explore results* (`--force` redoes it) | about a minute |
+| `gif`     | `vame.gif`: the animal next to its path through the UMAP, as a `.gif` (needs `input.videos`) | under a minute |
 | `status`  | Shows which steps are done | instant |
 | `run`     | `validate` then all of the above (`--force` redoes every step); `videos` only runs if `input.videos` is set | |
 
@@ -161,8 +164,25 @@ The form is saved automatically before each command, so what runs is always what
 | *Verbose* | Adds `-v`: more detailed output |
 | *Stop* | Ends the running command (asks first) |
 | *Open output folder* | Opens the output folder in Finder / Explorer |
+| *Explore results…* | Opens the results window (below); *Watch the videos…* in the Data tab opens it on the videos |
 | *Clear* | Empties the output panel |
 | *On GPU server* | Runs the commands on the server set in the *GPU server* tab (see below) |
+
+**Explore results**
+
+*Explore results…* opens a second window to look at what went in and what came out,
+and to act on it. *Segmentation* (top) picks `hmm` or `kmeans` when the method is `both`.
+
+| Tab | What you can do |
+|---|---|
+| *Recordings* | Play each input video, with the motif and community of the frame shown under it. *Find* a motif or community and jump from one bout of it to the next |
+| *Motifs & communities* | VAME's motif tree (motif circles sized by time spent) next to the UMAP of the latent space. Choose the integer at which to cut the tree (the box, or click the tree at that height): the communities it makes are shown at once. *Apply this cut* saves it as *Community cut tree* and runs `communities`. Click the map to see that moment of the recording |
+| *Communities & clips* | Each community and its motifs, with the share of time. Select a motif to play its clip (from `videos`). Name the communities and *Save names*: writes `community_labels.csv` and a `<recording>_motifs_labeled.csv` per recording |
+| *GIF* | Make a `vame.gif` for a recording (runs `gif`), and play the GIFs made |
+
+The map is computed once by `umap` (*Make the motif map*), and again after retraining.
+Names are kept with the motifs of each community, so a name stays with its group when a
+new cut renumbers the communities, and is dropped if that group is split.
 
 **Changing settings later** works as in the terminal: a new number of motifs or method,
 just *Run all* again; a change in the *Advanced* tab, alignment, exclusions or minimum
@@ -236,13 +256,19 @@ outputs/
 ├── motifs/
 │   └── hmm/                         (and/or kmeans/)
 │       ├── <recording>_motifs.csv   frame, time_s, motif
-│       └── motif_usage.csv          share of time in each motif, one row per recording
+│       ├── motif_usage.csv          share of time in each motif, one row per recording
+│       ├── community_labels.csv     community, label, motifs   (after 'Save names')
+│       └── <recording>_motifs_labeled.csv   frame, time_s, motif, community, label
+├── gifs/<recording>_<algorithm>_<label>_<start>-<end>.gif   (after 'gif')
 ├── runs/<date>_<command>/           experiment.yaml copy, versions.txt, run.log
 └── vame_project/                    VAME's own project (model, logs, plots in model/evaluate/)
-    └── results/<recording>/VAME/hmm-<n_clusters>/cluster_videos/
-        ├── <recording>-motif_0.mp4  (only if input.videos was set, after 'videos')
-        ├── <recording>-motif_1.mp4
-        └── ...
+    └── results/
+        ├── umap_embedding.npz       the map of 'umap'
+        ├── community_cohort/hmm-<n_clusters>/   tree.graphml, tree.png, cohort_community_bag.npy
+        └── <recording>/VAME/hmm-<n_clusters>/cluster_videos/
+            ├── community_0/<recording>-motif_2.mp4  (only if input.videos was set, after 'videos')
+            ├── community_0/<recording>-motif_6.mp4
+            └── ...
 ```
 
 `<recording>_motifs.csv`:
@@ -294,7 +320,9 @@ src/vame_motifs/
 ├── io.py           read_dlc_csv()  DLC CSV -> PoseFile
 ├── validation.py   validate()      checks before any VAME step (uses config.py + io.py)
 ├── pipeline.py     VamePipeline    the VAME steps (vame-py 0.14.4)
-└── export.py       export_motifs() labels -> motif CSVs + usage summary; run records
+├── export.py       export_motifs() labels -> motif CSVs + usage summary; run records
+├── communities.py  cut_tree()      VAME's motif tree -> communities; names -> *_labeled.csv
+└── viewer.py       Explorer        the 'Explore results' window (videos, tree, map, names, GIFs)
 ```
 
 Only `cli.py` prints. The other modules return data or raise one of four errors

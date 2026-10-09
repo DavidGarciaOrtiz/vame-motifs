@@ -83,3 +83,47 @@ def test_group_videos_by_community_moves_clips_into_community_subfolders(experim
             f"{pose_path.stem}-motif_3.mp4",
             f"{pose_path.stem}-motif_4.mp4",
         ]
+
+
+def test_new_cut_moves_grouped_clips_to_their_new_community(experiment):
+    cfg = load_config(experiment)
+    pipeline = VamePipeline(cfg)
+    _write_community_bag(pipeline, "hmm", [[0, 2], [1, 3, 4]])
+    session = cfg.pose_files[0].stem
+    video_dir = pipeline.motif_videos_dir(session, "hmm")
+    video_dir.mkdir(parents=True)
+    for motif in range(5):
+        (video_dir / f"{session}-motif_{motif}.mp4").write_bytes(b"")
+    pipeline._group_videos_by_community("hmm")
+
+    pipeline.community_bag_file("hmm").unlink()
+    np.save(pipeline.community_bag_file("hmm"), np.array([[0, 1, 2, 3], [4]], dtype=object))
+    pipeline._group_videos_by_community("hmm")
+
+    assert sorted(p.name for p in video_dir.iterdir()) == ["community_0", "community_1"]
+    assert len(list((video_dir / "community_0").glob("*.mp4"))) == 4
+    assert {m: p.parent.name for m, p in pipeline.motif_clips(session, "hmm").items()}[4] == "community_1"
+
+
+def test_pose_matrix_orders_columns_x_y_confidence_per_keypoint():
+    import xarray as xr
+
+    from vame_motifs.pipeline import _pose_matrix
+
+    # Stored as VAME stores it: (time, space, keypoints, individuals).
+    position = np.array([[[10, 20], [11, 21]]], dtype=float)[..., None]  # x: 10, 20; y: 11, 21
+    confidence = np.array([[0.9, 0.8]])[..., None]
+    ds = xr.Dataset({"position": (("time", "space", "keypoints", "individuals"), position),
+                     "confidence": (("time", "keypoints", "individuals"), confidence)})
+
+    assert _pose_matrix(ds).tolist() == [[10, 11, 0.9, 20, 21, 0.8]]
+
+
+def test_gif_start_is_in_a_well_tracked_stretch(experiment):
+    pipeline = VamePipeline(load_config(experiment))  # min_confidence 0.9, time_window 30
+    confidence = np.full((1000, 2), 0.99)
+    confidence[:600 + 15, 0] = 0.1  # poorly tracked until window 600 (frame 615)
+
+    start = pipeline._well_tracked_start(confidence, num_points=900, length=100)
+
+    assert 595 <= start <= 800  # at least 95% of its frames well tracked

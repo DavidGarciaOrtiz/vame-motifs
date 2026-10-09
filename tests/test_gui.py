@@ -25,3 +25,12 @@ def test_missing_sections_keep_defaults():
 def test_read_bodyparts(experiment):
     pose = sorted((experiment.parent / "pose").glob("*.csv"))[0]
     assert read_bodyparts(pose) == ["snout", "left_ear", "right_ear", "centre", "tailbase"]
+
+
+def test_bouts_are_runs_of_frames():
+    import numpy as np
+
+    from vame_motifs.viewer import bouts
+
+    assert bouts(np.array([0, 1, 1, 0, 0, 1, 0, 1, 1, 1], dtype=bool)).tolist() == [[1, 2], [5, 5], [7, 9]]
+    assert bouts(np.zeros(4, dtype=bool)).tolist() == []

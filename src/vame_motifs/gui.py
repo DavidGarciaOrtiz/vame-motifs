@@ -1,9 +1,12 @@
 """Desktop window for vame-motifs: ``vame-motifs-gui`` (or ``python -m vame_motifs.gui``).
 
-The window adds nothing to the analysis. It does two things:
+The window adds nothing to the analysis. It does three things:
 
 - edits the experiment YAML (the same file the CLI reads), as a form;
-- runs the CLI commands on that file and shows their output.
+- runs the CLI commands on that file and shows their output;
+- 'Explore results' (viewer.py): plays the input videos and motif clips, shows
+  the motif tree and UMAP, lets the user pick the tree cut, name the
+  communities (saved as *_labeled.csv) and make GIFs (vame.gif).
 
 Each command runs as its own process (``python -m vame_motifs <command> -c
 <yaml>``), exactly as it would from a terminal: same steps, same run records,
@@ -139,6 +142,8 @@ class App(ttk.Frame):
         self.tunnel_settings: remote.RemoteSettings | None = None
         self.tunnel_ready = False
         self.askpass_dir: str | None = None
+        self.on_done = None                            # called with the exit code when the job ends
+        self.explorer = None                           # the 'Explore results' window, when open
 
         root.title("vame-motifs")
         root.minsize(980, 680)
@@ -208,6 +213,8 @@ class App(ttk.Frame):
         self._entry(data, 5, "Output folder", "output", browse="folder")
         ttk.Label(data, text="Paths are relative to the experiment file.", foreground="gray").grid(
             row=6, column=0, columnspan=5, sticky="w", pady=(10, 0))
+        ttk.Button(data, text="Watch the videos…", command=lambda: self.open_explorer("recordings")).grid(
+            row=7, column=0, sticky="w", pady=(10, 0))
 
         # --- Body parts ---------------------------------------------------
         kp = ttk.Frame(notebook, padding=10)
@@ -345,6 +352,10 @@ class App(ttk.Frame):
         self.stop_button = ttk.Button(actions, text="Stop", command=self.stop, state="disabled")
         self.stop_button.pack(side="left", padx=4)
         ttk.Button(actions, text="Open output folder", command=self.open_output).pack(side="right")
+        ttk.Button(box, text="Explore results…", command=lambda: self.open_explorer("map")).grid(
+            row=row + 2, column=0, columnspan=2, sticky="ew", pady=(10, 0), ipady=4)
+        ttk.Label(box, text="Videos, motif tree and map, community names, GIFs", foreground="gray").grid(
+            row=row + 3, column=0, columnspan=2, sticky="w")
 
     def _build_log(self) -> None:
         frame = ttk.LabelFrame(self, text="Output", padding=4)
@@ -515,13 +526,15 @@ class App(ttk.Frame):
     # ==================================================================
     # Running commands
     # ==================================================================
-    def run_command(self, command: str) -> None:
+    def run_command(self, command: str, extra: list[str] | None = None, on_done=None) -> None:
+        """Run a vame-motifs command on the experiment. ``extra``: more command-line arguments;
+        ``on_done(exit code)`` is called when it ends (the Explorer reloads its results)."""
         if self.running:
             return
         if self.dirty or self.yaml_path is None:
             if not self.save():
                 return
-        flags = []
+        flags = list(extra or [])
         if self.force.get() and command in ("run", "segment"):
             flags.append("--force")
         if self.verbose.get():
@@ -543,6 +556,7 @@ class App(ttk.Frame):
 
         self.job_remote = self.run_remote.get()
         self.stopping = False
+        self.on_done = on_done
         self._set_running(command)
         threading.Thread(target=self._run_job, args=(steps,), daemon=True).start()
 
@@ -624,6 +638,9 @@ class App(ttk.Frame):
         for button in self.step_buttons:
             button.configure(state="normal")
         self.stop_button.configure(state="disabled")
+        on_done, self.on_done = self.on_done, None
+        if on_done is not None:
+            on_done(-1 if self.stopping else code)
 
     def _set_running(self, command: str) -> None:
         self.running = True
@@ -774,6 +791,27 @@ class App(ttk.Frame):
         if self.tunnel.poll() is None:
             self.tunnel.terminate()
 
+    # ==================================================================
+    # Explore results (viewer.py)
+    # ==================================================================
+    def open_explorer(self, tab: str = "map") -> None:
+        """The 'Explore results' window, on one of its tabs (viewer.Explorer.TABS)."""
+        if self.explorer is None:
+            if (self.dirty or self.yaml_path is None) and not self.save():
+                return
+            from vame_motifs.config import load_config
+            try:
+                from vame_motifs import viewer  # matplotlib, OpenCV: loaded only when needed
+                cfg = load_config(self.yaml_path)
+            except ImportError as e:
+                messagebox.showerror("Explore results", f"Missing package: {e}. Install VAME (section 1 of the README).")
+                return
+            except Exception as e:  # ConfigError and friends: what 'validate' would say
+                messagebox.showerror("Explore results", f"Cannot read the experiment: {e}")
+                return
+            self.explorer = viewer.Explorer(self, cfg)
+        self.explorer.show(tab)
+
     def open_output(self) -> None:
         folder = self._resolve(self.vars["output"].get().strip() or "outputs")
         if not folder.exists():
@@ -801,6 +839,8 @@ class App(ttk.Frame):
         self.log.configure(state="disabled")
 
     def on_close(self) -> None:
+        if self.explorer is not None:
+            self.explorer.close()
         if self.running:
             if not messagebox.askyesno("Quit", "A command is still running. Stop it and quit?"):
                 return

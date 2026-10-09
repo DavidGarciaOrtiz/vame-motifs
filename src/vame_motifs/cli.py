@@ -8,6 +8,7 @@ Typical use::
 
     vame-motifs validate -c experiment.yaml     # seconds: check the CSVs and the YAML
     vame-motifs run      -c experiment.yaml     # everything: prepare, train, segment, export, communities, videos
+    vame-motifs gif      -c experiment.yaml --session rat01 --length 300
 
 Exit codes: 0 success, 1 a problem with the input or a missing step
 (short message, no traceback), 2 wrong command-line arguments.
@@ -85,6 +86,20 @@ def cmd_videos(cfg: ExperimentConfig, args) -> None:
     print(f"Wrote motif videos (grouped by community) under {cfg.output / cfg.project_name / 'results'}")
 
 
+def cmd_umap(cfg: ExperimentConfig, args) -> None:
+    pipeline = VamePipeline(cfg)
+    if pipeline.has_umap() and not args.force:
+        print(f"Motif map already made: {pipeline.umap_path} (use --force to redo)")
+        return
+    print(f"Wrote the motif map to {pipeline.umap()}")
+
+
+def cmd_gif(cfg: ExperimentConfig, args) -> None:
+    path = VamePipeline(cfg).gif(session=args.session, algorithm=args.algorithm, start=args.start,
+                                 length=args.length, label=args.label, subtract_background=args.subtract_background)
+    print(f"Wrote {path}")
+
+
 def cmd_run(cfg: ExperimentConfig, args) -> None:
     cmd_validate(cfg, args)  # fail in seconds, not after preprocessing
     VamePipeline(cfg).run(force=args.force)
@@ -107,9 +122,10 @@ def cmd_status(cfg: ExperimentConfig, args) -> None:
     for algorithm in cfg.algorithms:
         n_csv = len(list((cfg.motifs_dir / algorithm).glob("*_motifs.csv")))
         print(f"  export   : {algorithm}: {n_csv}/{len(cfg.pose_files)} motif CSVs")
+    print(f"  community: {mark(pipeline.has_community())}")
     if cfg.videos:
-        print(f"  community: {mark(pipeline.has_community())}")
         print(f"  videos   : {mark(pipeline.has_motif_videos())}")
+    print(f"  umap     : {mark(pipeline.has_umap())}")
 
 
 # name -> (function, help text, keeps a run record?)
@@ -122,6 +138,8 @@ COMMANDS: dict[str, tuple[Callable, str, bool]] = {
     "export":   (cmd_export,   "Write motif CSVs + motif usage summary", False),
     "communities": (cmd_communities, "Group motifs with similar transitions into communities", True),
     "videos":   (cmd_videos,   "Cut a short .mp4 per motif, per session, from input.videos, grouped by community", True),
+    "umap":     (cmd_umap,     "Map the latent space in 2-D (UMAP), for the window's motif map", True),
+    "gif":      (cmd_gif,      "vame.gif: the animal next to its path through the UMAP, as a .gif", True),
     "run":      (cmd_run,      "validate -> prepare -> train -> segment -> export -> communities -> videos", True),
     "status":   (cmd_status,   "Show which steps are done", False),
 }
@@ -141,7 +159,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("command", choices=COMMANDS, metavar="COMMAND", help="one of: " + ", ".join(COMMANDS))
     parser.add_argument("-c", "--config", required=True, help="experiment YAML file")
-    parser.add_argument("--force", action="store_true", help="redo finished steps (run) / overwrite segmentation (segment)")
+    parser.add_argument("--force", action="store_true",
+                        help="redo finished steps (run) / overwrite segmentation (segment) / redo the map (umap)")
+    gif = parser.add_argument_group("gif options")
+    gif.add_argument("--session", help="recording to show (default: the first)")
+    gif.add_argument("--algorithm", choices=["hmm", "kmeans"], help="segmentation to colour by (default: the first)")
+    gif.add_argument("--start", type=int, help="first time window (default: random, from the seed)")
+    gif.add_argument("--length", type=int, default=500, help="number of frames (default: 500)")
+    gif.add_argument("--label", choices=["motif", "community", "none"], default="community",
+                     help="colour the map by (default: community)")
+    gif.add_argument("--subtract-background", action="store_true", help="remove the static background from the frames")
     parser.add_argument("-v", "--verbose", action="store_true", help="more detailed logging")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser

@@ -10,6 +10,8 @@ VAME's config and calls VAME's functions in order:
     segment  motif segmentation (hmm and/or kmeans)
     videos   cut a short .mp4 per motif per session from input.videos (optional),
              grouped into per-community folders (runs community analysis first)
+    umap     2-D UMAP of the latent space, for the window's motif map
+    gif      vame.gif: the animal next to its path through the UMAP, as a .gif
 
 Whether a step is done is decided by the files it must produce, not by VAME's
 states/states.json: VAME logs some failures and still records "success".
@@ -60,6 +62,13 @@ def _import_vame():
             f"VAME is not installed in this environment ({e}). Install it with: python -m pip install vame-py=={VAME_VERSION}"
         ) from e
     return vame
+
+
+def _pose_matrix(ds) -> np.ndarray:
+    """Frames x (x, y, confidence) per keypoint, in keypoint order, from VAME's pose dataset."""
+    position = ds["position"].isel(individuals=0).transpose("time", "keypoints", "space").values
+    confidence = ds["confidence"].isel(individuals=0).transpose("time", "keypoints").values
+    return np.concatenate([position, confidence[..., None]], axis=2).reshape(len(position), -1)
 
 
 class VamePipeline:
@@ -182,6 +191,8 @@ class VamePipeline:
         missing = [a for a in self.cfg.algorithms if not self.community_bag_file(a).exists()]
         if missing:
             raise PipelineError(f"VAME did not create a community grouping for '{missing[0]}'. See {self._log('community')}")
+        for algorithm in self.cfg.algorithms:  # clips cut earlier: into the folders of the new communities
+            self._group_videos_by_community(algorithm)
 
     def _motif_to_community(self, algorithm: str) -> dict[int, int]:
         bag = np.load(self.community_bag_file(algorithm), allow_pickle=True)
@@ -201,19 +212,34 @@ class VamePipeline:
         )
 
     def _group_videos_by_community(self, algorithm: str) -> None:
-        """Move each session's flat motif clips into community_<i>/ subfolders of cluster_videos/."""
+        """Move each session's motif clips into community_<i>/ subfolders of cluster_videos/.
+
+        Clips already in a community folder are moved again if a new cut changed
+        their community; folders left empty are removed.
+        """
         motif_to_community = self._motif_to_community(algorithm)
         for pose_path in self.cfg.pose_files:
             session = pose_path.stem
             clips_dir = self.motif_videos_dir(session, algorithm)
-            for clip in clips_dir.glob(f"{session}-motif_*.mp4"):
+            for clip in list(clips_dir.glob(f"**/{session}-motif_*.mp4")):
                 motif = int(clip.stem.rsplit("_", 1)[-1])
                 community = motif_to_community.get(motif)
                 if community is None:
                     continue  # motif had no frames, so VAME never wrote a clip for it
                 dest_dir = clips_dir / f"community_{community}"
-                dest_dir.mkdir(exist_ok=True)
-                clip.rename(dest_dir / clip.name)
+                if clip.parent != dest_dir:
+                    dest_dir.mkdir(exist_ok=True)
+                    clip.rename(dest_dir / clip.name)
+            for folder in clips_dir.glob("community_*"):
+                if folder.is_dir() and not any(folder.iterdir()):
+                    folder.rmdir()
+
+    def motif_clips(self, session: str, algorithm: str) -> dict[int, Path]:
+        """motif -> its clip for this session, wherever it is under cluster_videos/."""
+        return {
+            int(clip.stem.rsplit("_", 1)[-1]): clip
+            for clip in self.motif_videos_dir(session, algorithm).glob(f"**/{session}-motif_*.mp4")
+        }
 
     def motif_videos(self) -> None:
         """One short .mp4 per motif, per session, cut from input.videos and grouped by community."""
@@ -229,6 +255,191 @@ class VamePipeline:
             self._group_videos_by_community(algorithm)
         if not self.has_motif_videos():
             raise PipelineError(f"VAME did not create any motif videos. See {self._log('motif_videos')}")
+
+    # --- motif map: UMAP of the latent space (for the window) ----------
+    def latent_file(self, session: str) -> Path:
+        """One latent vector per time window, saved by 'segment'."""
+        return self.project_path / "results" / session / MODEL_NAME / "latent_vectors.npy"
+
+    @property
+    def umap_path(self) -> Path:
+        return self.project_path / "results" / "umap_embedding.npz"
+
+    def has_umap(self) -> bool:
+        """The map exists and was made from the current model (retraining makes it stale)."""
+        return (
+            self.umap_path.exists()
+            and self.model_path.exists()
+            and self.umap_path.stat().st_mtime >= self.model_path.stat().st_mtime
+        )
+
+    def umap(self) -> Path:
+        """2-D UMAP of the latent vectors of all sessions, sampled to VAME's num_points.
+
+        Saved as umap_embedding.npz: ``embedding`` (points x 2) and, per point,
+        ``session`` (index into ``sessions``) and ``window`` (index into that
+        session's motif labels). Labels are not stored: motifs and communities
+        change with n_clusters and the cut, the map does not.
+        """
+        missing = [self.latent_file(p.stem) for p in self.cfg.pose_files if not self.latent_file(p.stem).exists()]
+        if missing:
+            raise PipelineError(f"No latent vectors at {missing[0]}. Run 'segment' first.")
+        import umap  # installed with VAME; imported here because it is slow to load
+
+        sessions = [p.stem for p in self.cfg.pose_files]
+        counts = [len(np.load(self.latent_file(s), mmap_mode="r")) for s in sessions]
+        session_of = np.repeat(np.arange(len(sessions)), counts)
+        window_of = np.concatenate([np.arange(n) for n in counts])
+        n_points = min(int(self.config.get("num_points", 30_000)), len(session_of))
+        rng = np.random.default_rng(self.cfg.seed)
+        picked = np.sort(rng.choice(len(session_of), size=n_points, replace=False))
+        latent = np.concatenate([np.load(self.latent_file(s)) for s in sessions])[picked]
+
+        logger.info("UMAP of %d of %d time windows...", n_points, len(session_of))
+        reducer = umap.UMAP(
+            n_components=2,
+            min_dist=self.config.get("min_dist", 0.1),
+            n_neighbors=self.config.get("n_neighbors", 200),
+            random_state=self.cfg.seed,
+        )
+        embedding = reducer.fit_transform(latent)
+        np.savez(self.umap_path, embedding=embedding, session=session_of[picked], window=window_of[picked],
+                 sessions=np.array(sessions))
+        return self.umap_path
+
+    # --- vame.gif: the animal and its path through the UMAP -------------
+    def _well_tracked_start(self, confidence: np.ndarray, num_points: int, length: int) -> int:
+        """A random first window (from the seed) among those whose frames have both alignment body
+        parts tracked above min_confidence; VAME crops around them, so poor tracking shows no animal."""
+        good = (confidence > self.cfg.min_confidence).all(axis=1).astype(float)
+        lag = self.cfg.time_window // 2  # window i is shown on frame i + lag
+        good = np.concatenate([[0.0], np.cumsum(good[lag:lag + num_points])])
+        share = (good[length:] - good[:-length]) / length  # share of good frames from each start
+        share = share[: num_points - length + 1]
+        candidates = np.flatnonzero(share >= min(0.95, share.max()))
+        return int(np.random.default_rng(self.cfg.seed).choice(candidates))
+
+    def _link_raw_video(self, session: str) -> Path:
+        """Make sure VAME's data/raw/<session><suffix> opens: it is where VAME reads the frames.
+
+        VAME's init links it to input.videos. A project trained on the GPU server
+        and copied back keeps a link to the server's path, which does not open
+        here: it is pointed again at this computer's input.videos.
+        """
+        video = self.cfg.videos[[p.stem for p in self.cfg.pose_files].index(session)]
+        raw = self.project_path / "data" / "raw" / f"{session}{video.suffix.lower()}"
+        if not raw.exists():  # missing, or a link to a path that is not on this computer
+            if not video.exists():
+                raise PipelineError(f"input.videos: {video} does not exist")
+            if raw.is_symlink():
+                raw.unlink()
+            raw.symlink_to(video.resolve())
+        return video
+
+    def gif(self, session: str | None = None, algorithm: str | None = None, start: int | None = None,
+            length: int = 500, label: str = "community", subtract_background: bool = False,
+            max_lag: int = 30, crop_size: tuple[int, int] = (300, 300)) -> Path:
+        """What vame.gif() makes, for one session: per frame, the aligned, cropped animal next
+        to the UMAP of its latent space with the last ``max_lag`` steps drawn as a path. The
+        frames are joined into ``<output>/gifs/<session>_<algorithm>_<label>_<start>-<end>.gif``.
+
+        vame.gif() in vame-py 0.14.4 cannot be called as is: it loads
+        ``latent_vector_<session>.npy``, which segment_session no longer writes
+        (it is ``latent_vectors.npy`` now), and it runs every session. So this
+        writes the per-session embedding vame.gif expects, then calls the two
+        functions vame.gif is made of (get_animal_frames, create_video).
+
+        ``label``: colour the UMAP points by 'motif', 'community' or 'none'.
+        ``start``: first time window; random (from the seed) if not given.
+        """
+        _import_vame()
+        import matplotlib.pyplot as plt
+        import umap
+        from PIL import Image
+        from vame.analysis.gif_creator import create_video
+        from vame.io.load_poses import load_vame_dataset
+        from vame.util import gif_pose_helper
+
+        sessions = [p.stem for p in self.cfg.pose_files]
+        session = session or sessions[0]
+        if session not in sessions:
+            raise PipelineError(f"Unknown session '{session}'. Sessions: {', '.join(sessions)}")
+        algorithm = algorithm or self.cfg.algorithms[0]
+        if algorithm not in self.cfg.algorithms:
+            raise PipelineError(f"Segmentation '{algorithm}' is not in this experiment ({', '.join(self.cfg.algorithms)})")
+        if label not in ("motif", "community", "none"):
+            raise PipelineError(f"label must be motif, community or none (got '{label}')")
+        if not self.cfg.videos:
+            raise PipelineError("No raw videos configured (input.videos). The gif shows frames of the original recording.")
+        if not self.label_file(session, algorithm).exists():
+            raise PipelineError("No motif labels yet. Run 'segment' first.")
+        if label == "community" and not self.has_community():
+            self.community()
+
+        results = self.label_file(session, algorithm).parent
+        (results / "community").mkdir(exist_ok=True)
+        embed_path = results / "community" / f"umap_embedding_{session}.npy"
+        num_points = int(self.config.get("num_points", 30_000))
+        if embed_path.exists():
+            embed = np.load(embed_path)
+        else:
+            latent = np.load(self.latent_file(session))[:num_points]
+            logger.info("UMAP of %d time windows of %s...", len(latent), session)
+            embed = umap.UMAP(n_components=2, min_dist=self.config.get("min_dist", 0.1),
+                              n_neighbors=self.config.get("n_neighbors", 200),
+                              random_state=self.cfg.seed).fit_transform(latent)
+            np.save(embed_path, embed)
+        num_points = min(num_points, len(embed))
+
+        if length < 2:
+            raise PipelineError("The gif needs at least 2 frames (length)")
+        if length > num_points:
+            raise PipelineError(f"length {length} is longer than the {num_points} time windows of the map")
+        # Alignment body parts, by their position in VAME's copy of the pose file.
+        ds = load_vame_dataset(ds_path=str(self.project_path / "data" / "raw" / f"{session}.nc"))
+        pose = _pose_matrix(ds)
+        keypoints = [str(k) for k in ds.keypoints.values]
+        pose_ref_index = [keypoints.index(self.cfg.align_center), keypoints.index(self.cfg.align_direction)]
+
+        if start is None:
+            start = self._well_tracked_start(pose[:, [3 * i + 2 for i in pose_ref_index]], num_points, length)
+        if not 0 <= start <= num_points - length:
+            raise PipelineError(f"start must be between 0 and {num_points - length} for length {length}")
+
+        if label == "motif":
+            colours = np.load(self.label_file(session, algorithm))
+        elif label == "community":
+            colours = np.load(results / "community" / f"cohort_community_label_{session}.npy")
+        else:
+            colours = None
+        video = self._link_raw_video(session)
+
+        frames_dir = results / "gif_frames"  # where create_video writes its PNGs
+        frames_dir.mkdir(exist_ok=True)
+        # get_animal_frames reads the poses with VAME's read_pose_estimation_file, whose matrix
+        # has the columns mixed up (vame-py 0.14.4 flattens (space, keypoints) as (keypoints,
+        # space)), so it would crop around the wrong points. It is given the right matrix.
+        vame_reader = gif_pose_helper.read_pose_estimation_file
+        gif_pose_helper.read_pose_estimation_file = lambda file_path, **_: (None, pose.copy(), ds)
+        try:
+            frames = gif_pose_helper.get_animal_frames(self.config, session, pose_ref_index, start, length,
+                                                       subtract_background, video.suffix.lower(), crop_size)
+            if len(frames) < length:
+                raise PipelineError(f"Only {len(frames)} of {length} video frames could be read from {video.name}")
+            create_video(str(results), session, embed, colours, frames, start, length, max_lag, num_points)
+            plt.close("all")
+            images = [Image.open(frames_dir / f"{session}gif_{i}.png").convert("RGB") for i in range(length)]
+            out_dir = self.cfg.output / "gifs"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out = out_dir / f"{session}_{algorithm}_{label}_{start}-{start + length}.gif"
+            images[0].save(out, save_all=True, append_images=images[1:], loop=0,
+                           duration=round(1000 / self.cfg.fps))
+        finally:
+            gif_pose_helper.read_pose_estimation_file = vame_reader
+            for png in frames_dir.glob("*.png"):
+                png.unlink()
+            frames_dir.rmdir()
+        return out
 
     # --- all steps ------------------------------------------------------
     def run(self, force: bool = False) -> None:
