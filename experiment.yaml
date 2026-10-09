@@ -1,0 +1,20 @@
+input:
+  pose_files: /Users/david/Documents/results_analysis/01022023_001_16236-62755DLC_Resnet50_Test-ExampleSep16shuffle1_snapshot_best-84_filtered.csv
+  videos: /Users/david/Documents/results_analysis/01022023_001_16236-62755DLC_Resnet50_Test-ExampleSep16shuffle1_snapshot_best-84_filtered_p60_labeled.mp4
+  fps: 30
+keypoints:
+  align_center: snout
+  align_direction: tail
+  exclude: []
+cleaning:
+  min_confidence: 0.9
+motifs:
+  n_clusters: 15
+  method: hmm
+output: outputs
+advanced:
+  max_epochs: 100
+  time_window: 30
+  zdims: 30
+  seed: 42
+  community_cut_tree: 3

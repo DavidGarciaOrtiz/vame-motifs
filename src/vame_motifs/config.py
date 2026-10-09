@@ -34,7 +34,7 @@ class ExperimentConfig:
     align_direction: str
     n_clusters: int
     method: str = "hmm"
-    min_confidence: float = 0.9
+    min_confidence: float = 0.75
     exclude: list[str] = field(default_factory=list)
     videos: list[Path] = field(default_factory=list)
     output: Path = Path("outputs")
