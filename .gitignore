@@ -20,3 +20,7 @@ outputs/
 
 # Local assistant instructions
 CLAUDE.md
+
+# Personal experiment files and examples: kept locally, not published
+/experiment.yaml
+/examples/

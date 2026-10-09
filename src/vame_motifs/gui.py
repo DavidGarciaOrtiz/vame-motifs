@@ -42,7 +42,7 @@ from vame_motifs.config import METHODS, VIDEO_SUFFIXES
 # Commands in pipeline order, as buttons. 'run' gets its own, larger button.
 STEP_COMMANDS = ["validate", "init", "prepare", "train", "segment", "export", "communities", "videos"]
 
-# Form defaults: the same values as examples/experiment.yaml and config.py.
+# Form defaults: the same values as the README's example experiment and config.py.
 DEFAULTS = {
     "pose_files": "",
     "videos": "",

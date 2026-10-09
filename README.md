@@ -47,8 +47,9 @@ VAME picks the device by itself: CUDA GPU if present, then Apple MPS, then CPU.
   a video `rat01.mp4` is paired with the pose file `rat01DLC_resnet50_....csv` because
   the video's name is a prefix of the pose file's. `.mp4` and `.avi` are supported.
 
-- **Experiment file:** copy [`examples/experiment.yaml`](examples/experiment.yaml)
-  next to your data and edit it. Paths in it are relative to the YAML file.
+- **Experiment file:** save the example below as `experiment.yaml` next to your
+  data and edit it (or let the window write it for you). Paths in it are relative
+  to the YAML file.
 
 ```yaml
 input:
