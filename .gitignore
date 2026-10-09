@@ -17,3 +17,6 @@ outputs/
 # OS / editor
 .DS_Store
 .vscode/
+
+# Local assistant instructions
+CLAUDE.md
